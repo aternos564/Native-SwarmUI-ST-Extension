@@ -1,4 +1,4 @@
-import { eventSource, event_types, saveSettingsDebounced } from '../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
