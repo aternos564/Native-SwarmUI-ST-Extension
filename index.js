@@ -229,7 +229,7 @@ async function generate(panel) {
 
         let src = imagePath;
         if (!src.startsWith('data:')) {
-            src = new URL(imagePath, s.url.replace(/\\/+$/, '') + '/').toString();
+            src = new URL(imagePath, s.url.replace(/\/+$/, '') + '/').toString();
         }
 
         $('<img>')
@@ -244,7 +244,7 @@ async function generate(panel) {
     }
 }
 
-function openPanel() {
+async function openPanel() {
     const html = $(`
         <div id="swarmui_native_panel">
             <div class="swarm_row">
@@ -303,7 +303,7 @@ function openPanel() {
         </div>
     `);
 
-    $('#swarmui_native_origin').text(window.location.origin);
+    html.find('#swarmui_native_origin').text(window.location.origin);
     bindPanel(html);
 
     await callGenericPopup(html, POPUP_TYPE.TEXT, '', {
@@ -313,32 +313,121 @@ function openPanel() {
     });
 }
 
+const BUTTON_ID = 'swarmui_native_button';
+const OWN_CONTAINER_ID = 'swarmui_native_wand_container';
+const LEGACY_CONTAINER_ID = 'token_counter_wand_container';
+
+function log(...args) {
+    console.log('[Native SwarmUI]', ...args);
+}
+
+function getMenuContainer() {
+    let own = $(`#${OWN_CONTAINER_ID}`);
+    if (own.length) {
+        return own;
+    }
+
+    const menu = $('#extensionsMenu');
+    if (menu.length) {
+        own = $(`<div id="${OWN_CONTAINER_ID}" class="extension_container"></div>`);
+        menu.append(own);
+        log(`created own wand container #${OWN_CONTAINER_ID}`);
+        return own;
+    }
+
+    const legacy = $(`#${LEGACY_CONTAINER_ID}`);
+    if (legacy.length) {
+        return legacy;
+    }
+
+    return $();
+}
+
 function ensureMenuButton() {
-    if ($('#swarmui_native_button').length) {
+    if ($(`#${BUTTON_ID}`).length) {
         return true;
     }
 
-    const container = $('#token_counter_wand_container');
+    const container = getMenuContainer();
     if (!container.length) {
+        log('wand menu not ready yet, retrying later');
         return false;
     }
 
     const buttonHtml = `
-        <div id="swarmui_native_button" class="list-group-item flex-container flexGap5">
+        <div id="${BUTTON_ID}" class="list-group-item flex-container flexGap5">
             <div class="fa-solid fa-wand-magic-sparkles extensionsMenuExtensionButton"></div>
             <span>Native SwarmUI</span>
         </div>`;
 
     container.append(buttonHtml);
-    $('#swarmui_native_button').on('click', openPanel);
+    $(`#${BUTTON_ID}`).on('click', openPanel);
+    log(`button #${BUTTON_ID} created in #${container.attr('id') || 'extensionsMenu'}`);
     return true;
 }
 
+function watchWandMenu() {
+    if (typeof MutationObserver === 'undefined') {
+        return;
+    }
+
+    const observer = new MutationObserver(() => {
+        if ($(`#${BUTTON_ID}`).length) {
+            observer.disconnect();
+            return;
+        }
+        if (ensureMenuButton()) {
+            observer.disconnect();
+        }
+    });
+
+    if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+        window.setTimeout(() => observer.disconnect(), 15000);
+    }
+}
+
+let initialized = false;
+
 export function init() {
+    if (initialized) {
+        ensureMenuButton();
+        return;
+    }
+    initialized = true;
+
+    log('init called');
     settings();
     ensureMenuButton();
-    eventSource.on(event_types.APP_INITIALIZED, ensureMenuButton);
-    eventSource.on(event_types.APP_READY, ensureMenuButton);
+    try {
+        eventSource.on(event_types.APP_INITIALIZED, ensureMenuButton);
+        eventSource.on(event_types.APP_READY, ensureMenuButton);
+    } catch (error) {
+        console.warn('[Native SwarmUI] event subscription failed:', error);
+    }
     window.setTimeout(ensureMenuButton, 0);
     window.setTimeout(ensureMenuButton, 500);
+    window.setTimeout(ensureMenuButton, 2000);
+    watchWandMenu();
+}
+
+// Direct-execution fallback (same pattern as real third-party
+// extensions like Extension-Dice): if the `activate` hook is missed,
+// the module still self-initializes on load. Guarded + idempotent.
+if (typeof jQuery !== 'undefined') {
+    jQuery(() => {
+        try {
+            init();
+        } catch (error) {
+            console.error('[Native SwarmUI] fallback init failed:', error);
+        }
+    });
+} else if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', () => {
+        try {
+            init();
+        } catch (error) {
+            console.error('[Native SwarmUI] fallback init failed:', error);
+        }
+    });
 }
