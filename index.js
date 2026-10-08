@@ -1,13 +1,15 @@
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
-import { extension_settings } from '../../../extensions.js';
+import { extension_settings, getContext } from '../../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 
 const MODULE = 'swarmui_native';
 
 const defaults = {
     url: 'http://192.168.1.6:7801',
     model: 'illustriousAnimilf_v10.safetensors',
-    lora: '',
+    loras: [],
     loraWeight: 0.8,
     vae: '',
     prompt: '',
@@ -17,18 +19,29 @@ const defaults = {
     width: 1024,
     height: 1024,
     sampler: 'euler_ancestral',
+    count: 1,
+    seed: -1,
 };
 
 function settings() {
     if (!extension_settings[MODULE]) {
         extension_settings[MODULE] = {};
     }
+    const s = extension_settings[MODULE];
+    // Migrate legacy single-LoRA setting (0.2.x) to the array form.
+    if (s.lora !== undefined && s.loras === undefined) {
+        s.loras = s.lora ? [s.lora] : [];
+        delete s.lora;
+    }
+    if (!Array.isArray(s.loras)) {
+        s.loras = [];
+    }
     for (const [key, value] of Object.entries(defaults)) {
-        if (extension_settings[MODULE][key] === undefined) {
-            extension_settings[MODULE][key] = value;
+        if (s[key] === undefined) {
+            s[key] = value;
         }
     }
-    return extension_settings[MODULE];
+    return s;
 }
 
 function setValue(key, value) {
@@ -94,7 +107,6 @@ async function refreshResources(panel) {
         }
 
         const loraSelect = panel.find('#swarmui_native_lora').empty();
-        $('<option>').val('').text('None').appendTo(loraSelect);
         for (const file of loraData.files || []) {
             $('<option>').val(file.name).text(file.name).appendTo(loraSelect);
         }
@@ -111,9 +123,9 @@ async function refreshResources(panel) {
             s.model = modelSelect.val();
         }
 
-        loraSelect.val(s.lora);
-        if (!loraSelect.val()) {
-            s.lora = '';
+        loraSelect.val(s.loras);
+        if (loraSelect.val() === null) {
+            s.loras = [];
         }
 
         vaeSelect.val(s.vae || '');
@@ -122,7 +134,7 @@ async function refreshResources(panel) {
         }
 
         saveSettingsDebounced();
-        status.text(`Connected • ${modelSelect.find('option').length} models • ${loraSelect.find('option').length - 1} LoRAs • ${vaeSelect.find('option').length - 1} VAEs`);
+        status.text(`Connected • ${modelSelect.find('option').length} models • ${loraSelect.find('option').length} LoRAs • ${vaeSelect.find('option').length - 1} VAEs`);
     } catch (error) {
         console.error('Native SwarmUI resource error:', error);
         status.text(`Connection failed: ${error.message}`);
@@ -134,7 +146,7 @@ function bindPanel(panel) {
 
     panel.find('#swarmui_native_url').val(s.url);
     panel.find('#swarmui_native_model').val(s.model);
-    panel.find('#swarmui_native_lora').val(s.lora);
+    panel.find('#swarmui_native_lora').val(s.loras);
     panel.find('#swarmui_native_lora_weight').val(s.loraWeight);
     panel.find('#swarmui_native_vae').val(s.vae || '');
     panel.find('#swarmui_native_prompt').val(s.prompt);
@@ -144,6 +156,8 @@ function bindPanel(panel) {
     panel.find('#swarmui_native_width').val(s.width);
     panel.find('#swarmui_native_height').val(s.height);
     panel.find('#swarmui_native_sampler').val(s.sampler);
+    panel.find('#swarmui_native_count').val(s.count);
+    panel.find('#swarmui_native_seed').val(s.seed);
 
     panel.find('#swarmui_native_url').on('change', function() {
         setValue('url', String($(this).val()).trim());
@@ -152,7 +166,7 @@ function bindPanel(panel) {
         setValue('model', String($(this).val()));
     });
     panel.find('#swarmui_native_lora').on('change', function() {
-        setValue('lora', String($(this).val()));
+        setValue('loras', Array.from($(this).val() || []).map(String));
     });
     panel.find('#swarmui_native_lora_weight').on('change', function() {
         setValue('loraWeight', Number($(this).val()));
@@ -166,7 +180,7 @@ function bindPanel(panel) {
     panel.find('#swarmui_native_negative').on('input', function() {
         setValue('negative', String($(this).val()));
     });
-    for (const id of ['steps', 'cfg', 'width', 'height']) {
+    for (const id of ['steps', 'cfg', 'width', 'height', 'count', 'seed']) {
         panel.find(`#swarmui_native_${id}`).on('change', function() {
             setValue(id, Number($(this).val()));
         });
@@ -177,38 +191,96 @@ function bindPanel(panel) {
 
     panel.find('#swarmui_native_refresh').on('click', () => refreshResources(panel));
     panel.find('#swarmui_native_generate').on('click', () => generate(panel));
+    panel.find('#swarmui_native_send_chat').on('click', () => generate(panel, { sendToChat: true }));
 }
 
-async function generate(panel) {
+function resolveImageSrc(imagePath) {
+    if (imagePath.startsWith('data:')) {
+        return imagePath;
+    }
+    const base = settings().url.replace(/\/+$/, '') + '/';
+    try {
+        return new URL(imagePath, base).toString();
+    } catch {
+        return base + String(imagePath).replace(/^\/+/, '');
+    }
+}
+
+async function sendToChat(imageSrc, prompt) {
+    const context = getContext();
+    const message = {
+        name: context.name2 || 'SwarmUI',
+        is_user: false,
+        is_system: false,
+        send_date: Date.now(),
+        mes: prompt ? `[SwarmUI] ${prompt}` : '[SwarmUI image]',
+        extra: {
+            media: [{
+                url: imageSrc,
+                type: 'img',
+                title: prompt || 'SwarmUI image',
+                generation_type: 'swarmui_native',
+                source: 'GENERATED',
+            }],
+            media_display: 'GALLERY',
+            media_index: 0,
+            inline_image: false,
+        },
+    };
+    context.chat.push(message);
+    const messageId = context.chat.length - 1;
+    await eventSource.emit(event_types.MESSAGE_RECEIVED, messageId, 'extension');
+    context.addOneMessage(message);
+    await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, messageId, 'extension');
+    await context.saveChat();
+    return messageId;
+}
+
+async function generate(panel, options = {}) {
     const s = settings();
     const status = panel.find('#swarmui_native_status');
     const output = panel.find('#swarmui_native_output');
 
+    // Prompt passes through untouched: SwarmUI owns prompt syntax.
     const prompt = String(panel.find('#swarmui_native_prompt').val() || '').trim();
     if (!prompt) {
         status.text('Enter a prompt first.');
-        return;
+        return { images: [] };
     }
 
-    const session_id = await newSession();
+    let session_id;
+    try {
+        session_id = await newSession();
+    } catch (error) {
+        console.error('Native SwarmUI session error:', error);
+        status.text(`Connection failed: ${error.message}`);
+        return { images: [] };
+    }
 
+    const count = Math.min(4, Math.max(1, Number(panel.find('#swarmui_native_count').val()) || 1));
+    const seed = Number(panel.find('#swarmui_native_seed').val());
+    const loras = Array.from(panel.find('#swarmui_native_lora').val() || []).map(String);
+    const loraWeight = Number(panel.find('#swarmui_native_lora_weight').val()) || 0.8;
+    // Field names/types per SwarmUI T2IParamTypes (prompt, negativeprompt,
+    // model, loras/loraweights, vae, sampler, steps, cfgscale, width,
+    // height, images, seed); numbers stay numbers.
     const payload = {
         session_id,
         prompt,
         negativeprompt: String(panel.find('#swarmui_native_negative').val() || ''),
-        cfgscale: String(Number(panel.find('#swarmui_native_cfg').val()) || 5),
-        steps: String(Number(panel.find('#swarmui_native_steps').val()) || 20),
-        width: String(Number(panel.find('#swarmui_native_width').val()) || 1024),
-        height: String(Number(panel.find('#swarmui_native_height').val()) || 1024),
+        cfgscale: Number(panel.find('#swarmui_native_cfg').val()) || 5,
+        steps: Math.round(Number(panel.find('#swarmui_native_steps').val()) || 20),
+        width: Math.round(Number(panel.find('#swarmui_native_width').val()) || 1024),
+        height: Math.round(Number(panel.find('#swarmui_native_height').val()) || 1024),
         model: String(panel.find('#swarmui_native_model').val() || ''),
         sampler: String(panel.find('#swarmui_native_sampler').val() || 'euler_ancestral'),
-        images: '1',
+        images: count,
+        seed: Number.isFinite(seed) ? Math.round(seed) : -1,
     };
 
-    const lora = String(panel.find('#swarmui_native_lora').val() || '');
-    if (lora) {
-        payload.loras = [lora];
-        payload.loraweights = [Number(panel.find('#swarmui_native_lora_weight').val()) || 0.8];
+    if (loras.length) {
+        payload.loras = loras;
+        payload.loraweights = loras.map(() => loraWeight);
     }
 
     const vae = String(panel.find('#swarmui_native_vae').val() || '');
@@ -221,26 +293,33 @@ async function generate(panel) {
 
     try {
         const result = await apiPost('GenerateText2Image', payload);
-        const imagePath = result.images?.[0];
+        const imagePaths = result.images || [];
 
-        if (!imagePath) {
+        if (!imagePaths.length) {
             throw new Error('SwarmUI returned no image.');
         }
 
-        let src = imagePath;
-        if (!src.startsWith('data:')) {
-            src = new URL(imagePath, s.url.replace(/\/+$/, '') + '/').toString();
+        const srcs = imagePaths.map(resolveImageSrc);
+        for (const src of srcs) {
+            $('<img>')
+                .attr('src', src)
+                .attr('alt', 'SwarmUI result')
+                .appendTo(output);
         }
 
-        $('<img>')
-            .attr('src', src)
-            .attr('alt', 'SwarmUI result')
-            .appendTo(output);
-
-        status.text('Generation complete ✅');
+        if (options.sendToChat) {
+            for (const src of srcs) {
+                await sendToChat(src, prompt);
+            }
+            status.text(`Generation complete ✅ • sent ${srcs.length} image(s) to chat`);
+        } else {
+            status.text(`Generation complete ✅ • ${srcs.length} image(s)`);
+        }
+        return { images: srcs };
     } catch (error) {
         console.error('Native SwarmUI generation error:', error);
         status.text(`Generation failed: ${error.message}`);
+        return { images: [] };
     }
 }
 
@@ -257,8 +336,8 @@ async function openPanel() {
             <label>Model</label>
             <select id="swarmui_native_model" class="text_pole"></select>
 
-            <label>LoRA</label>
-            <select id="swarmui_native_lora" class="text_pole"></select>
+            <label>LoRA (Ctrl/Cmd-click for multiple; one weight applies to all)</label>
+            <select id="swarmui_native_lora" class="text_pole" multiple size="4"></select>
 
             <label>VAE</label>
             <select id="swarmui_native_vae" class="text_pole"></select>
@@ -293,7 +372,19 @@ async function openPanel() {
             </div>
 
             <div class="swarm_row">
+                <div>
+                    <label>Images (1–4)</label>
+                    <input id="swarmui_native_count" type="number" class="text_pole" min="1" max="4" step="1">
+                </div>
+                <div>
+                    <label>Seed (-1 = random)</label>
+                    <input id="swarmui_native_seed" type="number" class="text_pole" step="1">
+                </div>
+            </div>
+
+            <div class="swarm_row">
                 <button id="swarmui_native_generate" class="menu_button">Generate</button>
+                <button id="swarmui_native_send_chat" class="menu_button" title="Generate and post the image(s) to the current chat">Generate + Send to Chat</button>
             </div>
 
             <div id="swarmui_native_output"></div>
@@ -305,6 +396,9 @@ async function openPanel() {
 
     html.find('#swarmui_native_origin').text(window.location.origin);
     bindPanel(html);
+    // Load real models/LoRAs/VAEs immediately so the panel never shows
+    // stale hard-coded lists. Failures surface in #swarmui_native_status.
+    refreshResources(html);
 
     await callGenericPopup(html, POPUP_TYPE.TEXT, '', {
         wide: true,
@@ -389,6 +483,55 @@ function watchWandMenu() {
 
 let initialized = false;
 
+async function slashGenerate(promptText) {
+    const s = settings();
+    const prompt = String(promptText || '').trim();
+    if (!prompt) {
+        return '';
+    }
+    const session_id = await newSession();
+    const payload = {
+        session_id,
+        prompt,
+        negativeprompt: s.negative || '',
+        cfgscale: Number(s.cfg) || 5,
+        steps: Math.round(Number(s.steps)) || 20,
+        width: Math.round(Number(s.width)) || 1024,
+        height: Math.round(Number(s.height)) || 1024,
+        model: s.model || '',
+        sampler: s.sampler || 'euler_ancestral',
+        images: Math.min(4, Math.max(1, Math.round(Number(s.count)) || 1)),
+        seed: Number.isFinite(Number(s.seed)) ? Math.round(Number(s.seed)) : -1,
+    };
+    if (s.loras && s.loras.length) {
+        payload.loras = s.loras.map(String);
+        payload.loraweights = s.loras.map(() => Number(s.loraWeight) || 0.8);
+    }
+    if (s.vae) {
+        payload.vae = s.vae;
+    }
+    const result = await apiPost('GenerateText2Image', payload);
+    const srcs = (result.images || []).map(resolveImageSrc);
+    for (const src of srcs) {
+        await sendToChat(src, prompt);
+    }
+    return srcs[0] || '';
+}
+
+function registerSlashCommand() {
+    try {
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'swarm',
+            callback: async (_args, value) => await slashGenerate(value),
+            returns: 'URL of the generated image, or empty string on failure',
+            helpString: 'Generate an image with native SwarmUI (model/LoRA/VAE/sampler from the Native SwarmUI panel) and post it to chat. Usage: /swarm your prompt here',
+        }));
+        log('slash command /swarm registered');
+    } catch (error) {
+        console.warn('[Native SwarmUI] slash command registration failed:', error);
+    }
+}
+
 export function init() {
     if (initialized) {
         ensureMenuButton();
@@ -399,6 +542,7 @@ export function init() {
     log('init called');
     settings();
     ensureMenuButton();
+    registerSlashCommand();
     try {
         eventSource.on(event_types.APP_INITIALIZED, ensureMenuButton);
         eventSource.on(event_types.APP_READY, ensureMenuButton);
