@@ -1,8 +1,11 @@
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
-import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
-import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
+
+// NOTE: SlashCommand modules are imported lazily inside
+// registerSlashCommand(). A static import would fail the entire module
+// (and lose the wand button) if those paths ever move. The button must
+// never depend on optional features.
 
 const MODULE = 'swarmui_native';
 
@@ -518,8 +521,10 @@ async function slashGenerate(promptText) {
     return srcs[0] || '';
 }
 
-function registerSlashCommand() {
+async function registerSlashCommand() {
     try {
+        const { SlashCommand } = await import('../../../slash-commands/SlashCommand.js');
+        const { SlashCommandParser } = await import('../../../slash-commands/SlashCommandParser.js');
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'swarm',
             callback: async (_args, value) => await slashGenerate(value),

@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Local",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "auto_update": true,
     "homePage": "https://github.com/aternos564/Native-SwarmUI-ST-Extension",
     "hooks": {
