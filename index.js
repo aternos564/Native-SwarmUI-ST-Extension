@@ -1,4 +1,4 @@
-import { saveSettingsDebounced } from '../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced } from '../../../script.js';
 import { extension_settings } from '../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../popup.js';
 
@@ -313,8 +313,15 @@ function openPanel() {
     });
 }
 
-export function init() {
-    settings();
+function ensureMenuButton() {
+    if ($('#swarmui_native_button').length) {
+        return true;
+    }
+
+    const container = $('#token_counter_wand_container');
+    if (!container.length) {
+        return false;
+    }
 
     const buttonHtml = `
         <div id="swarmui_native_button" class="list-group-item flex-container flexGap5">
@@ -322,6 +329,16 @@ export function init() {
             <span>Native SwarmUI</span>
         </div>`;
 
-    $('#token_counter_wand_container').append(buttonHtml);
+    container.append(buttonHtml);
     $('#swarmui_native_button').on('click', openPanel);
+    return true;
+}
+
+export function init() {
+    settings();
+    ensureMenuButton();
+    eventSource.on(event_types.APP_INITIALIZED, ensureMenuButton);
+    eventSource.on(event_types.APP_READY, ensureMenuButton);
+    window.setTimeout(ensureMenuButton, 0);
+    window.setTimeout(ensureMenuButton, 500);
 }
