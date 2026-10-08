@@ -1,0 +1,21 @@
+#swarmui_native_panel {
+    padding: 8px;
+}
+#swarmui_native_panel .swarm_row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+#swarmui_native_panel .swarm_row > * {
+    flex: 1;
+}
+#swarmui_native_panel img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+}
+#swarmui_native_status {
+    margin: 6px 0;
+    opacity: .8;
+}

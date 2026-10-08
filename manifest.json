@@ -1,0 +1,11 @@
+{
+    "display_name": "Native SwarmUI",
+    "loading_order": 20,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Local",
+    "version": "0.2.0",
+    "homePage": "https://github.com/aternos564/Native-SwarmUI-ST-Extension"
+}
