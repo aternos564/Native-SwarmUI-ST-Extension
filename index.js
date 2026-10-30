@@ -1,606 +1,2463 @@
-import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
-import { extension_settings, getContext } from '../../../extensions.js';
-import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
+/**
+ * swarm-image-gen — SwarmUI text-to-image generation for SillyTavern.
+ *
+ * Transport:
+ *   - `direct` : the browser calls SwarmUI itself (requires SwarmUI to allow the
+ *                SillyTavern origin, i.e. AccessControlAllowOrigin).
+ *   - `proxy`  : requests go through SillyTavern's own /proxy/ route, which is
+ *                server-side, so SwarmUI's CORS check never applies.
+ *                Requires `enableCorsProxy: true` (or `--corsProxy`) in SillyTavern.
+ *   - `auto`   : tries `direct` first and falls back to `proxy` (default).
+ *
+ * Only one import is used on purpose (kept intentionally small so that the
+ * extension keeps working across SillyTavern updates).
+ */
 
-// NOTE: SlashCommand modules are imported lazily inside
-// registerSlashCommand(). A static import would fail the entire module
-// (and lose the wand button) if those paths ever move. The button must
-// never depend on optional features.
+import { saveBase64AsFile } from '../../../utils.js';
 
-const MODULE = 'swarmui_native';
+/* ------------------------------------------------------------------ *
+ * Constants
+ * ------------------------------------------------------------------ */
 
-const defaults = {
-    url: 'http://192.168.1.6:7801',
-    model: 'illustriousAnimilf_v10.safetensors',
-    loras: [],
-    loraWeight: 0.8,
-    vae: '',
-    prompt: '',
-    negative: '',
-    steps: 20,
-    cfg: 5,
-    width: 1024,
-    height: 1024,
-    sampler: 'euler_ancestral',
-    count: 1,
-    seed: -1,
+/** Key inside extension_settings. Never rename this without a migration. */
+const EXTENSION_KEY = 'swarm_image_gen';
+/**
+ * Key used to store the per-character appearance tags on the character card. The name is
+ * kept from the old "look tags" box so existing values survive; clothing belongs in
+ * OUTFIT_TAGS_KEY now.
+ */
+const LOOK_TAGS_KEY = 'swarm_look_tags';
+/** Key used to store the per-character outfit tags on the character card. */
+const OUTFIT_TAGS_KEY = 'swarm_outfit';
+/** Prefix for all console output. */
+const LOG = '[swarm]';
+const DEFAULT_BASE_URL = 'http://127.0.0.1:7801';
+/** Mirrors scripts/script.js systemUserName. */
+const SYSTEM_USER_NAME = 'SillyTavern System';
+
+const REQUEST_TIMEOUT_MS = 30_000;
+const GENERATION_TIMEOUT_MS = 15 * 60 * 1000;
+const TAGS_SAVE_DELAY_MS = 600;
+const SCROLL_DELAY_MS = 200;
+/** Default emphasis of the appearance/outfit tags (1 = plain tags, no weighting). */
+const DEFAULT_TAG_WEIGHT = 1.2;
+/** Guards the emphasis setting so a typo cannot wreck every prompt. */
+const TAG_WEIGHT_MIN = 0.5;
+const TAG_WEIGHT_MAX = 1.8;
+
+/** Media enum values (scripts/constants.js). */
+const MEDIA_TYPE_IMAGE = 'image';
+const MEDIA_SOURCE_GENERATED = 'generated';
+const MEDIA_DISPLAY_GALLERY = 'gallery';
+/** generationMode.MESSAGE from the built-in Stable Diffusion extension. */
+const GENERATION_TYPE_MESSAGE = -1;
+
+const ALLOWED_IMAGE_FORMATS = ['bmp', 'png', 'jpg', 'jpeg', 'jfif', 'webp', 'gif'];
+
+const DEFAULT_LLM_INSTRUCTION = [
+    'You write image generation prompts for a Stable Diffusion model.',
+    'Read the end of the chat and describe the current scene as a single comma-separated list of visual tags.',
+    'Include: shot framing (close-up, portrait, upper body, full body),',
+    'each visible character\'s pose, expression, what they are doing, location, time of day, lighting and mood.',
+    'Do not describe clothing or outfits; those are provided separately and must stay consistent.',
+    'Use Danbooru-style tags (e.g. "1girl, solo, sitting on a park bench, sunset"),',
+    'never sentences, never quotes, never explanations, never markdown.',
+    'Only output the tags themselves, on one line, separated by commas. Use at most 60 tags.',
+].join(' ');
+
+/**
+ * "Send me a picture of:" sources — the same entries the built-in Image Generation
+ * extension offers in its wand-menu submenu. They travel through `generateImage({ source })`
+ * and `/swarm <key>` accepts them as well.
+ */
+const PICTURE_SOURCES = {
+    you: 'Yourself',
+    face: 'Your Face',
+    me: 'Me',
+    scene: 'The Whole Story',
+    last: 'The Last Message',
+    raw_last: 'Raw Last Message',
+    background: 'Background',
 };
 
-function settings() {
-    if (!extension_settings[MODULE]) {
-        extension_settings[MODULE] = {};
-    }
-    const s = extension_settings[MODULE];
-    // Migrate legacy single-LoRA setting (0.2.x) to the array form.
-    if (s.lora !== undefined && s.loras === undefined) {
-        s.loras = s.lora ? [s.lora] : [];
-        delete s.lora;
-    }
-    if (!Array.isArray(s.loras)) {
-        s.loras = [];
-    }
-    for (const [key, value] of Object.entries(defaults)) {
-        if (s[key] === undefined) {
-            s[key] = value;
-        }
-    }
-    return s;
+/**
+ * Instructions for the sources that the chat model has to describe. These are the built-in
+ * extension's own prompt templates, so each entry produces the same kind of prompt as
+ * SillyTavern's "Generate Image" menu. "Raw Last Message" is not here: it uses the message
+ * text itself and never calls the model.
+ */
+const SOURCE_INSTRUCTIONS = {
+    you: 'In the next response I want you to provide only a detailed comma-delimited list of keywords and phrases which describe {{char}}. The list must include all of the following items in this order: name, species and race, gender, age, clothing, occupation, physical features and appearances. Do not include descriptions of non-visual qualities such as personality, movements, scents, mental traits, or anything which could not be seen in a still photograph. Do not write in full sentences. Prefix your description with the phrase \'full body portrait,\'',
+    face: 'In the next response I want you to provide only a detailed comma-delimited list of keywords and phrases which describe {{char}}. The list must include all of the following items in this order: name, species and race, gender, age, facial features and expressions, occupation, hair and hair accessories (if any), what they are wearing on their upper body (if anything). Do not describe anything below their neck. Do not include descriptions of non-visual qualities such as personality, movements, scents, mental traits, or anything which could not be seen in a still photograph. Do not write in full sentences. Prefix your description with the phrase \'close up facial portrait,\'',
+    me: 'Ignore previous instructions and provide a detailed description of {{user}}\'s physical appearance from the perspective of {{char}} in the form of a comma-delimited list of keywords and phrases. The list must include all of the following items in this order: name, species and race, gender, age, clothing, occupation, physical features and appearances. Do not include descriptions of non-visual qualities such as personality, movements, scents, mental traits, or anything which could not be seen in a still photograph. Do not write in full sentences. Prefix your description with the phrase \'full body portrait,\'. Ignore the rest of the story when crafting this description. Do not reply as {{char}} when writing this description, and do not attempt to continue the story.',
+    scene: 'Ignore previous instructions and provide a detailed description for all of the following: a brief recap of recent events in the story, {{char}}\'s appearance, and {{char}}\'s surroundings. Do not reply as {{char}} while writing this description.',
+    last: [
+        'Ignore previous instructions. Your next response must be formatted as a single comma-delimited list of concise keywords. The list will describe the visual details included in the last chat message.',
+        '',
+        'Only mention characters by using pronouns (\'he\',\'his\',\'she\',\'her\',\'it\',\'its\') or neutral nouns (\'male\', \'the man\', \'female\', \'the woman\').',
+        '',
+        'Ignore non-visible things such as feelings, personality traits, thoughts, and spoken dialog.',
+        '',
+        'Add keywords in this precise order:',
+        'a keyword to describe the location of the scene,',
+        'a keyword to mention how many characters of each gender or type are present in the scene (minimum of two characters: {{user}} and {{char}}, example: \'2 men \' or \'1 man 1 woman \', \'1 man 3 robots\'),',
+        'keywords to describe the relative physical positioning of the characters to each other (if a commonly known term for the positioning is known use it instead of describing the positioning in detail) + \'POV\',',
+        'a single keyword or phrase to describe the primary act taking place in the last chat message,',
+        'keywords to describe {{char}}\'s physical appearance and facial expression,',
+        'keywords to describe {{char}}\'s actions,',
+        'keywords to describe {{user}}\'s physical appearance and actions.',
+        '',
+        'If character actions involve direct physical interaction with another character, mention specifically which body parts interacting and how.',
+        '',
+        'A correctly formatted example response would be:',
+        '\'(location),(character list by gender),(primary action), (relative character position) POV, (character 1\'s description and actions), (character 2\'s description and actions)\'',
+    ].join('\n'),
+    background: 'Ignore previous instructions and provide a detailed description of {{char}}\'s surroundings in the form of a comma-delimited list of keywords and phrases. The list must include all of the following items in this order: location, time of day, weather, lighting, and any other relevant details. Do not include descriptions of characters and non-visual qualities such as names, personality, movements, scents, mental traits, or anything which could not be seen in a still photograph. Do not write in full sentences. Prefix your description with the phrase \'background,\'. Ignore the rest of the story when crafting this description. Do not reply as {{char}} when writing this description, and do not attempt to continue the story.',
+};
+
+/** Sources that never show the character, so her appearance and outfit tags are left out. */
+const SOURCES_WITHOUT_CHARACTER_TAGS = new Set(['me', 'background']);
+/** Sources that never show the user, so the persona's outfit tags are left out. */
+const SOURCES_WITHOUT_USER_TAGS = new Set(['you', 'face', 'background']);
+
+const defaultSettings = {
+    base_url: DEFAULT_BASE_URL,
+    transport: 'auto',
+    model: '',
+    /**
+     * '' means "let SwarmUI use the model's baked-in VAE".
+     * SwarmUI rejects the UI-only value "Automatic" when it is sent to the API,
+     * so the empty string is the correct "automatic" value for API clients.
+     */
+    vae: '',
+    width: 832,
+    height: 1216,
+    steps: 25,
+    cfg: 6,
+    sampler: 'euler_ancestral',
+    scheduler: 'normal',
+    seed: -1,
+    images: 1,
+    prefix_tags: '',
+    suffix_tags: '',
+    negative_prompt: '',
+    /** @type {{name: string, weight: number}[]} */
+    loras: [],
+    /** Weight pre-filled in the "add LoRA" box. */
+    lora_weight: 0.8,
+    /** Include per-character appearance tags in the prompt. */
+    use_look_tags: true,
+    /** Outfit tags per persona avatar, so "Your outfit" can differ per persona. */
+    user_outfits: {},
+    /** How hard the appearance/outfit tags are pushed against the scene (1 = plain tags). */
+    tag_weight: DEFAULT_TAG_WEIGHT,
+    /** Optional: hide SillyTavern's built-in image buttons so only this extension's button remains. */
+    hide_builtin_buttons: false,
+    /** Show an editable popup with the finished prompt right before the request is sent. */
+    edit_before_generation: false,
+    /**
+     * Ask "New prompt" or "Old prompt, new image" when an image button is pressed. Reusing the
+     * last chat prompt costs no tokens, which matters when the chat LLM writes the prompts.
+     */
+    ask_prompt_choice: true,
+    /** The chat prompt of the last image, offered as "Old prompt, new image". */
+    last_prompt: '',
+    /** The "Send me a picture of:" source of the last image, reused together with last_prompt. */
+    last_source: '',
+    /** Watch outgoing user messages for image requests ("send me a picture of a cat") and generate automatically. */
+    interactive_mode: false,
+    /** Offer image generation to the chat model as a callable function tool. */
+    function_tool: false,
+    llm_prompt: false,
+    llm_instruction: DEFAULT_LLM_INSTRUCTION,
+    /** Cached dropdown contents so the UI is not empty after a reload. */
+    resources: {
+        models: [],
+        loras: [],
+        vaes: [],
+        samplers: [],
+        schedulers: [],
+    },
+};
+
+/* ------------------------------------------------------------------ *
+ * Small utilities
+ * ------------------------------------------------------------------ */
+
+/** @returns {any} SillyTavern context object */
+function ctx() {
+    return SillyTavern.getContext();
 }
-
-function setValue(key, value) {
-    settings()[key] = value;
-    saveSettingsDebounced();
-}
-
-function apiUrl(path) {
-    return settings().url.replace(/\/+$/, '') + '/API/' + path.replace(/^\/+/, '');
-}
-
-async function apiPost(path, body) {
-    const response = await fetch(apiUrl(path), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-        throw new Error(`SwarmUI HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    if (data.error) {
-        throw new Error(String(data.error));
-    }
-
-    return data;
-}
-
-async function newSession() {
-    const data = await apiPost('GetNewSession', {});
-    if (!data.session_id) {
-        throw new Error('SwarmUI did not return a session ID.');
-    }
-    return data.session_id;
-}
-
-async function listModels(subtype = undefined) {
-    const session_id = await newSession();
-    return await apiPost('ListModels', {
-        session_id,
-        path: '',
-        depth: 12,
-        ...(subtype ? { subtype } : {}),
-    });
-}
-
-async function refreshResources(panel) {
-    const status = panel.find('#swarmui_native_status');
-    status.text('Loading models, LoRAs and VAEs…');
-
-    try {
-        const [modelData, loraData, vaeData] = await Promise.all([
-            listModels('Stable-Diffusion'),
-            listModels('LoRA'),
-            listModels('VAE'),
-        ]);
-
-        const modelSelect = panel.find('#swarmui_native_model').empty();
-        for (const file of modelData.files || []) {
-            $('<option>').val(file.name).text(file.name).appendTo(modelSelect);
-        }
-
-        const loraSelect = panel.find('#swarmui_native_lora').empty();
-        for (const file of loraData.files || []) {
-            $('<option>').val(file.name).text(file.name).appendTo(loraSelect);
-        }
-
-        const vaeSelect = panel.find('#swarmui_native_vae').empty();
-        $('<option>').val('').text('Automatic').appendTo(vaeSelect);
-        for (const file of vaeData.files || []) {
-            $('<option>').val(file.name).text(file.name).appendTo(vaeSelect);
-        }
-
-        const s = settings();
-        modelSelect.val(s.model);
-        if (!modelSelect.val() && modelSelect.find('option').length) {
-            s.model = modelSelect.val();
-        }
-
-        loraSelect.val(s.loras);
-        if (loraSelect.val() === null) {
-            s.loras = [];
-        }
-
-        vaeSelect.val(s.vae || '');
-        if (vaeSelect.val() === null) {
-            s.vae = '';
-        }
-
-        saveSettingsDebounced();
-        status.text(`Connected • ${modelSelect.find('option').length} models • ${loraSelect.find('option').length} LoRAs • ${vaeSelect.find('option').length - 1} VAEs`);
-    } catch (error) {
-        console.error('Native SwarmUI resource error:', error);
-        status.text(`Connection failed: ${error.message}`);
-    }
-}
-
-function bindPanel(panel) {
-    const s = settings();
-
-    panel.find('#swarmui_native_url').val(s.url);
-    panel.find('#swarmui_native_model').val(s.model);
-    panel.find('#swarmui_native_lora').val(s.loras);
-    panel.find('#swarmui_native_lora_weight').val(s.loraWeight);
-    panel.find('#swarmui_native_vae').val(s.vae || '');
-    panel.find('#swarmui_native_prompt').val(s.prompt);
-    panel.find('#swarmui_native_negative').val(s.negative);
-    panel.find('#swarmui_native_steps').val(s.steps);
-    panel.find('#swarmui_native_cfg').val(s.cfg);
-    panel.find('#swarmui_native_width').val(s.width);
-    panel.find('#swarmui_native_height').val(s.height);
-    panel.find('#swarmui_native_sampler').val(s.sampler);
-    panel.find('#swarmui_native_count').val(s.count);
-    panel.find('#swarmui_native_seed').val(s.seed);
-
-    panel.find('#swarmui_native_url').on('change', function() {
-        setValue('url', String($(this).val()).trim());
-    });
-    panel.find('#swarmui_native_model').on('change', function() {
-        setValue('model', String($(this).val()));
-    });
-    panel.find('#swarmui_native_lora').on('change', function() {
-        setValue('loras', Array.from($(this).val() || []).map(String));
-    });
-    panel.find('#swarmui_native_lora_weight').on('change', function() {
-        setValue('loraWeight', Number($(this).val()));
-    });
-    panel.find('#swarmui_native_vae').on('change', function() {
-        setValue('vae', String($(this).val()));
-    });
-    panel.find('#swarmui_native_prompt').on('input', function() {
-        setValue('prompt', String($(this).val()));
-    });
-    panel.find('#swarmui_native_negative').on('input', function() {
-        setValue('negative', String($(this).val()));
-    });
-    for (const id of ['steps', 'cfg', 'width', 'height', 'count', 'seed']) {
-        panel.find(`#swarmui_native_${id}`).on('change', function() {
-            setValue(id, Number($(this).val()));
-        });
-    }
-    panel.find('#swarmui_native_sampler').on('change', function() {
-        setValue('sampler', String($(this).val()));
-    });
-
-    panel.find('#swarmui_native_refresh').on('click', () => refreshResources(panel));
-    panel.find('#swarmui_native_generate').on('click', () => generate(panel));
-    panel.find('#swarmui_native_send_chat').on('click', () => generate(panel, { sendToChat: true }));
-}
-
-function resolveImageSrc(imagePath) {
-    if (imagePath.startsWith('data:')) {
-        return imagePath;
-    }
-    const base = settings().url.replace(/\/+$/, '') + '/';
-    try {
-        return new URL(imagePath, base).toString();
-    } catch {
-        return base + String(imagePath).replace(/^\/+/, '');
-    }
-}
-
-function formatTiming(elapsedMs, count, steps) {
-    const total = elapsedMs / 1000;
-    const perImage = total / Math.max(1, count);
-    const parts = [`Time: ${total.toFixed(2)}s`];
-    if (count > 1) {
-        parts.push(`${perImage.toFixed(2)}s/image`);
-    }
-    if (steps > 0 && perImage > 0) {
-        parts.push(`≈${(steps / perImage).toFixed(2)} it/s`);
-    }
-    return parts.join(' • ');
-}
-
-async function sendToChat(imageSrc, prompt, timing) {
-    const context = getContext();
-    const messageText = prompt ? `[SwarmUI] ${prompt}` : '[SwarmUI image]';
-    const mes = timing ? `${messageText}\n${timing}` : messageText;
-    const message = {
-        name: context.name2 || 'SwarmUI',
-        is_user: false,
-        is_system: false,
-        send_date: Date.now(),
-        mes,
-        extra: {
-            media: [{
-                url: imageSrc,
-                type: 'img',
-                title: prompt || 'SwarmUI image',
-                generation_type: 'swarmui_native',
-                source: 'GENERATED',
-            }],
-            media_display: 'GALLERY',
-            media_index: 0,
-            inline_image: false,
-        },
-    };
-    context.chat.push(message);
-    const messageId = context.chat.length - 1;
-    await eventSource.emit(event_types.MESSAGE_RECEIVED, messageId, 'extension');
-    context.addOneMessage(message);
-    await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, messageId, 'extension');
-    await context.saveChat();
-    return messageId;
-}
-
-async function generate(panel, options = {}) {
-    const s = settings();
-    const status = panel.find('#swarmui_native_status');
-    const output = panel.find('#swarmui_native_output');
-
-    // Prompt passes through untouched: SwarmUI owns prompt syntax.
-    const prompt = String(panel.find('#swarmui_native_prompt').val() || '').trim();
-    if (!prompt) {
-        status.text('Enter a prompt first.');
-        return { images: [] };
-    }
-
-    const startedAt = performance.now();
-
-    let session_id;
-    try {
-        session_id = await newSession();
-    } catch (error) {
-        console.error('Native SwarmUI session error:', error);
-        status.text(`Connection failed: ${error.message}`);
-        return { images: [] };
-    }
-
-    const count = Math.min(4, Math.max(1, Number(panel.find('#swarmui_native_count').val()) || 1));
-    const seed = Number(panel.find('#swarmui_native_seed').val());
-    const loras = Array.from(panel.find('#swarmui_native_lora').val() || []).map(String);
-    const loraWeight = Number(panel.find('#swarmui_native_lora_weight').val()) || 0.8;
-    const steps = Math.round(Number(panel.find('#swarmui_native_steps').val()) || 20);
-    // Field names/types per SwarmUI T2IParamTypes (prompt, negativeprompt,
-    // model, loras/loraweights, vae, sampler, steps, cfgscale, width,
-    // height, images, seed); numbers stay numbers.
-    const payload = {
-        session_id,
-        prompt,
-        negativeprompt: String(panel.find('#swarmui_native_negative').val() || ''),
-        cfgscale: Number(panel.find('#swarmui_native_cfg').val()) || 5,
-        steps: Math.round(Number(panel.find('#swarmui_native_steps').val()) || 20),
-        width: Math.round(Number(panel.find('#swarmui_native_width').val()) || 1024),
-        height: Math.round(Number(panel.find('#swarmui_native_height').val()) || 1024),
-        model: String(panel.find('#swarmui_native_model').val() || ''),
-        sampler: String(panel.find('#swarmui_native_sampler').val() || 'euler_ancestral'),
-        images: count,
-        seed: Number.isFinite(seed) ? Math.round(seed) : -1,
-    };
-
-    if (loras.length) {
-        payload.loras = loras;
-        payload.loraweights = loras.map(() => loraWeight);
-    }
-
-    const vae = String(panel.find('#swarmui_native_vae').val() || '');
-    if (vae) {
-        payload.vae = vae;
-    }
-
-    status.text('Generating…');
-    output.empty();
-
-    try {
-        const result = await apiPost('GenerateText2Image', payload);
-        const imagePaths = result.images || [];
-
-        if (!imagePaths.length) {
-            throw new Error('SwarmUI returned no image.');
-        }
-
-        const srcs = imagePaths.map(resolveImageSrc);
-        for (const src of srcs) {
-            $('<img>')
-                .attr('src', src)
-                .attr('alt', 'SwarmUI result')
-                .appendTo(output);
-        }
-
-        const elapsedMs = performance.now() - startedAt;
-        const timing = formatTiming(elapsedMs, srcs.length, steps);
-
-        if (options.sendToChat) {
-            for (const src of srcs) {
-                await sendToChat(src, prompt, timing);
-            }
-            status.text(`Generation complete ✅ • ${srcs.length} image(s) • ${timing} • sent to chat`);
-        } else {
-            status.text(`Generation complete ✅ • ${srcs.length} image(s) • ${timing}`);
-        }
-        return { images: srcs, timing };
-    } catch (error) {
-        console.error('Native SwarmUI generation error:', error);
-        status.text(`Generation failed: ${error.message}`);
-        return { images: [] };
-    }
-}
-
-async function openPanel() {
-    const html = $(`
-        <div id="swarmui_native_panel">
-            <div class="swarm_row">
-                <input id="swarmui_native_url" class="text_pole" placeholder="SwarmUI URL">
-                <button id="swarmui_native_refresh" class="menu_button">Refresh</button>
-            </div>
-
-            <div id="swarmui_native_status">Not connected</div>
-
-            <label>Model</label>
-            <select id="swarmui_native_model" class="text_pole"></select>
-
-            <label>LoRA (Ctrl/Cmd-click for multiple; one weight applies to all)</label>
-            <select id="swarmui_native_lora" class="text_pole" multiple size="4"></select>
-
-            <label>VAE</label>
-            <select id="swarmui_native_vae" class="text_pole"></select>
-
-            <div class="swarm_row">
-                <div>
-                    <label>LoRA weight</label>
-                    <input id="swarmui_native_lora_weight" type="number" class="text_pole" min="0" max="2" step="0.05">
-                </div>
-                <div>
-                    <label>Sampler</label>
-                    <select id="swarmui_native_sampler" class="text_pole">
-                        <option value="euler_ancestral">euler_ancestral</option>
-                        <option value="euler">euler</option>
-                        <option value="dpmpp_2m">dpmpp_2m</option>
-                        <option value="dpmpp_2m_sde">dpmpp_2m_sde</option>
-                    </select>
-                </div>
-            </div>
-
-            <label>Prompt</label>
-            <textarea id="swarmui_native_prompt" class="text_pole autoSetHeight" rows="5"></textarea>
-
-            <label>Negative prompt</label>
-            <textarea id="swarmui_native_negative" class="text_pole autoSetHeight" rows="3"></textarea>
-
-            <div class="swarm_row">
-                <input id="swarmui_native_steps" type="number" class="text_pole" min="1" max="150" step="1" placeholder="Steps">
-                <input id="swarmui_native_cfg" type="number" class="text_pole" min="1" max="30" step="0.1" placeholder="CFG">
-                <input id="swarmui_native_width" type="number" class="text_pole" min="64" max="2048" step="64" placeholder="Width">
-                <input id="swarmui_native_height" type="number" class="text_pole" min="64" max="2048" step="64" placeholder="Height">
-            </div>
-
-            <div class="swarm_row">
-                <div>
-                    <label>Images (1–4)</label>
-                    <input id="swarmui_native_count" type="number" class="text_pole" min="1" max="4" step="1">
-                </div>
-                <div>
-                    <label>Seed (-1 = random)</label>
-                    <input id="swarmui_native_seed" type="number" class="text_pole" step="1">
-                </div>
-            </div>
-
-            <div class="swarm_row">
-                <button id="swarmui_native_generate" class="menu_button">Generate</button>
-                <button id="swarmui_native_send_chat" class="menu_button" title="Generate and post the image(s) to the current chat">Generate + Send to Chat</button>
-            </div>
-
-            <div id="swarmui_native_output"></div>
-            <small>
-                Browser origin: <span id="swarmui_native_origin"></span>
-            </small>
-        </div>
-    `);
-
-    html.find('#swarmui_native_origin').text(window.location.origin);
-    bindPanel(html);
-    // Load real models/LoRAs/VAEs immediately so the panel never shows
-    // stale hard-coded lists. Failures surface in #swarmui_native_status.
-    refreshResources(html);
-
-    await callGenericPopup(html, POPUP_TYPE.TEXT, '', {
-        wide: true,
-        large: true,
-        allowVerticalScrolling: true,
-    });
-}
-
-const BUTTON_ID = 'swarmui_native_button';
-const OWN_CONTAINER_ID = 'swarmui_native_wand_container';
-const LEGACY_CONTAINER_ID = 'token_counter_wand_container';
 
 function log(...args) {
-    console.log('[Native SwarmUI]', ...args);
+    console.log(LOG, ...args);
 }
 
-function getMenuContainer() {
-    let own = $(`#${OWN_CONTAINER_ID}`);
-    if (own.length) {
-        return own;
-    }
-
-    const menu = $('#extensionsMenu');
-    if (menu.length) {
-        own = $(`<div id="${OWN_CONTAINER_ID}" class="extension_container"></div>`);
-        menu.append(own);
-        log(`created own wand container #${OWN_CONTAINER_ID}`);
-        return own;
-    }
-
-    const legacy = $(`#${LEGACY_CONTAINER_ID}`);
-    if (legacy.length) {
-        return legacy;
-    }
-
-    return $();
+function warn(...args) {
+    console.warn(LOG, ...args);
 }
 
-function ensureMenuButton() {
-    if ($(`#${BUTTON_ID}`).length) {
-        return true;
-    }
-
-    const container = getMenuContainer();
-    if (!container.length) {
-        log('wand menu not ready yet, retrying later');
-        return false;
-    }
-
-    const buttonHtml = `
-        <div id="${BUTTON_ID}" class="list-group-item flex-container flexGap5">
-            <div class="fa-solid fa-wand-magic-sparkles extensionsMenuExtensionButton"></div>
-            <span>Native SwarmUI</span>
-        </div>`;
-
-    container.append(buttonHtml);
-    $(`#${BUTTON_ID}`).on('click', openPanel);
-    log(`button #${BUTTON_ID} created in #${container.attr('id') || 'extensionsMenu'}`);
-    return true;
+function logError(...args) {
+    console.error(LOG, ...args);
 }
 
-function watchWandMenu() {
-    if (typeof MutationObserver === 'undefined') {
-        return;
-    }
+/**
+ * SwarmUI cleans parameter IDs by lowercasing and dropping everything that is
+ * not a letter (T2IParamTypes.cs -> CleanTypeName).
+ * @param {string} name Parameter display name, e.g. "CFG Scale"
+ * @returns {string} Parameter ID, e.g. "cfgscale"
+ */
+function cleanTypeName(name) {
+    return String(name ?? '').toLowerCase().replace(/[^a-z]/g, '');
+}
 
-    const observer = new MutationObserver(() => {
-        if ($(`#${BUTTON_ID}`).length) {
-            observer.disconnect();
-            return;
-        }
-        if (ensureMenuButton()) {
-            observer.disconnect();
-        }
+/** Converts a UI value to a number; an empty value falls back instead of becoming 0. */
+function asNumber(value, fallback) {
+    if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) {
+        return fallback;
+    }
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function asBoolean(value) {
+    if (typeof value === 'boolean') {
+        return value;
+    }
+    return ['true', 'on', 'yes', '1'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+/** @returns {string} URL without a trailing slash, with a scheme. */
+function normalizeBaseUrl(url) {
+    let base = String(url ?? '').trim();
+    if (!base) {
+        base = DEFAULT_BASE_URL;
+    }
+    if (!/^https?:\/\//i.test(base)) {
+        base = `http://${base}`;
+    }
+    return base.replace(/\/+$/, '');
+}
+
+/** Encodes a SwarmUI output path ("View/local/raw/...") for use in a URL. */
+function encodeImagePath(path) {
+    return String(path)
+        .split('/')
+        .map((segment) => encodeURIComponent(segment))
+        .join('/');
+}
+
+/** Collapses a blob into raw base64 (no data URL prefix). */
+function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = String(reader.result ?? '');
+            const comma = result.indexOf(',');
+            resolve(comma >= 0 ? result.slice(comma + 1) : result);
+        };
+        reader.onerror = () => reject(reader.error ?? new Error('Could not read the image data'));
+        reader.readAsDataURL(blob);
     });
+}
 
-    if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
-        window.setTimeout(() => observer.disconnect(), 15000);
+/**
+ * Pulls SwarmUI's prompt-parser warnings (unknown LoRA name, broken weight, …) out of a
+ * generated PNG. SwarmUI only reports these inside the image metadata, so without this the
+ * generation just silently ignores the offending tag.
+ * @param {string} base64 Raw image data, no data URL prefix
+ * @returns {string[]}
+ */
+function readParserWarnings(base64) {
+    try {
+        const text = atob(base64);
+        const key = text.indexOf('parser_warnings');
+        if (key < 0) {
+            return [];
+        }
+        const start = text.indexOf('[', key);
+        if (start < 0) {
+            return [];
+        }
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+        for (let i = start; i < text.length; i++) {
+            const char = text[i];
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (char === '\\') escaped = true;
+                else if (char === '"') inString = false;
+                continue;
+            }
+            if (char === '"') inString = true;
+            else if (char === '[' || char === '{') depth++;
+            else if (char === ']' || char === '}') {
+                depth--;
+                if (depth === 0) {
+                    const parsed = JSON.parse(text.slice(start, i + 1));
+                    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+                }
+            }
+        }
+        return [];
+    } catch (error) {
+        warn('Could not read the SwarmUI prompt warnings from the image.', error);
+        return [];
     }
 }
 
-let initialized = false;
-
-async function slashGenerate(promptText) {
-    const s = settings();
-    const prompt = String(promptText || '').trim();
+/**
+ * Normalizes a comma separated tag list: collapses whitespace, removes empty
+ * entries and duplicate commas. Mirrors Agnai's fixImagePrompt().
+ * @param {string} prompt
+ * @returns {string}
+ */
+function fixImagePrompt(prompt) {
     if (!prompt) {
         return '';
     }
-    const startedAt = performance.now();
-    const session_id = await newSession();
-    const payload = {
-        session_id,
-        prompt,
-        negativeprompt: s.negative || '',
-        cfgscale: Number(s.cfg) || 5,
-        steps: Math.round(Number(s.steps)) || 20,
-        width: Math.round(Number(s.width)) || 1024,
-        height: Math.round(Number(s.height)) || 1024,
-        model: s.model || '',
-        sampler: s.sampler || 'euler_ancestral',
-        images: Math.min(4, Math.max(1, Math.round(Number(s.count)) || 1)),
-        seed: Number.isFinite(Number(s.seed)) ? Math.round(Number(s.seed)) : -1,
-    };
-    if (s.loras && s.loras.length) {
-        payload.loras = s.loras.map(String);
-        payload.loraweights = s.loras.map(() => Number(s.loraWeight) || 0.8);
-    }
-    if (s.vae) {
-        payload.vae = s.vae;
-    }
-    const result = await apiPost('GenerateText2Image', payload);
-    const srcs = (result.images || []).map(resolveImageSrc);
-    const elapsedMs = performance.now() - startedAt;
-    const timing = formatTiming(elapsedMs, srcs.length, Math.round(Number(s.steps)) || 20);
-    for (const src of srcs) {
-        await sendToChat(src, prompt, timing);
-    }
-    return srcs[0] || '';
+    return String(prompt)
+        .replace(/\s+/g, ' ')
+        .replace(/,+/g, ',')
+        .split(',')
+        .map((x) => x.trim())
+        .filter((x) => x.length > 0)
+        .join(', ');
 }
 
-async function registerSlashCommand() {
+/** Escapes text that goes into a popup body (popup text is inserted as HTML). */
+function escapeForPopup(text) {
+    return String(text ?? '').replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+    }[char]));
+}
+
+/** Removes text that we never want inside an image prompt. */
+function stripFormatting(text) {
+    if (!text) {
+        return '';
+    }
+    let out = String(text);
+    out = out.replace(/<think[\s\S]*?<\/think>/gi, ' ');
+    out = out.replace(/<thinking[\s\S]*?<\/thinking>/gi, ' ');
+    out = out.replace(/<reasoning[\s\S]*?<\/reasoning>/gi, ' ');
+    out = out.replace(/```[\s\S]*?```/g, ' ');
+    out = out.replace(/^[\s\S]*?<\/think>/i, ' '); // unterminated <think> block
+    out = out.replace(/["“”]/g, ' ');
+    out = out.replace(/\r?\n/g, ', ');
+    // Decompose accents so "café" becomes "cafe" instead of losing the letter.
+    out = out.normalize('NFD');
+    // Keep model syntax characters: , . : _ ( ) { } < > [ ] / - ' | #
+    // Everything else (markdown asterisks, quotes, punctuation, CJK) becomes a space.
+    out = out.replace(/[^a-zA-Z0-9.,:_(){}<>[\]/\-'|#]+/g, ' ');
+    return fixImagePrompt(out);
+}
+
+/** Applies SillyTavern macros to a user supplied tag list without ever throwing. */
+function substituteSafe(text) {
+    if (!text) {
+        return '';
+    }
     try {
-        const { SlashCommand } = await import('../../../slash-commands/SlashCommand.js');
-        const { SlashCommandParser } = await import('../../../slash-commands/SlashCommandParser.js');
-        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-            name: 'swarm',
-            callback: async (_args, value) => await slashGenerate(value),
-            returns: 'URL of the generated image, or empty string on failure',
-            helpString: 'Generate an image with native SwarmUI (model/LoRA/VAE/sampler from the Native SwarmUI panel) and post it to chat. Usage: /swarm your prompt here',
-        }));
-        log('slash command /swarm registered');
+        return ctx().substituteParamsExtended(String(text)) ?? String(text);
     } catch (error) {
-        console.warn('[Native SwarmUI] slash command registration failed:', error);
+        warn('Macro substitution failed, using the raw text.', error);
+        return String(text);
     }
 }
 
-export function init() {
-    if (initialized) {
-        ensureMenuButton();
+function toastrSafe(kind, message, title = 'Swarm Image Gen') {
+    try {
+        toastr[kind](message, title);
+    } catch {
+        log(kind, message);
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Settings
+ * ------------------------------------------------------------------ */
+
+/** @returns {any} The settings object, created/migrated on demand. */
+function getSettings() {
+    const context = ctx();
+    if (!context.extensionSettings[EXTENSION_KEY] || typeof context.extensionSettings[EXTENSION_KEY] !== 'object') {
+        context.extensionSettings[EXTENSION_KEY] = structuredClone(defaultSettings);
+        log('Created default settings.');
+    }
+
+    const settings = context.extensionSettings[EXTENSION_KEY];
+    for (const [key, value] of Object.entries(defaultSettings)) {
+        if (settings[key] === undefined) {
+            settings[key] = structuredClone(value);
+        }
+    }
+
+    // An early build had "hide the built-in image buttons" switched on by default and quietly removed
+    // SillyTavern's own button. It is off by default now, and a stored "on" nobody actually chose is
+    // dropped. Once the checkbox is used, hide_builtin_chosen remembers the real choice.
+    if (settings.hide_builtin_buttons === true && settings.hide_builtin_chosen !== true) {
+        settings.hide_builtin_buttons = false;
+    }
+
+    if (!Array.isArray(settings.loras)) {
+        settings.loras = [];
+    }
+    settings.loras = settings.loras
+        .filter((lora) => lora && typeof lora.name === 'string' && lora.name.length > 0)
+        .map((lora) => ({ name: lora.name, weight: asNumber(lora.weight, 1) }));
+
+    if (!settings.resources || typeof settings.resources !== 'object') {
+        settings.resources = structuredClone(defaultSettings.resources);
+    }
+    for (const key of Object.keys(defaultSettings.resources)) {
+        if (!Array.isArray(settings.resources[key])) {
+            settings.resources[key] = [];
+        }
+    }
+
+    if (typeof settings.llm_instruction !== 'string' || !settings.llm_instruction.trim()) {
+        settings.llm_instruction = DEFAULT_LLM_INSTRUCTION;
+    }
+
+    // Migration: "Automatic" is a SwarmUI UI-only value and is rejected by the API.
+    if (settings.vae === 'Automatic') {
+        settings.vae = '';
+    }
+
+    return settings;
+}
+
+function saveSettings() {
+    ctx().saveSettingsDebounced();
+}
+
+/* ------------------------------------------------------------------ *
+ * SwarmUI session / transport layer
+ * ------------------------------------------------------------------ */
+
+/** Current SwarmUI session id, or null. */
+let sessionId = null;
+/** Transport that last worked ('direct' | 'proxy'), or null when unknown. */
+let resolvedTransport = null;
+/** True while an image is being generated. */
+let busy = false;
+
+/** @returns {string[]} Transports to try, in order. */
+function transportCandidates(override) {
+    if (override) {
+        return [override];
+    }
+    const preferred = resolvedTransport;
+    const configured = getSettings().transport;
+    const base = configured === 'direct' ? ['direct']
+        : configured === 'proxy' ? ['proxy']
+            : ['direct', 'proxy'];
+    if (preferred && base.includes(preferred)) {
+        return [preferred, ...base.filter((t) => t !== preferred)];
+    }
+    return base;
+}
+
+/**
+ * Builds the request URL for a SwarmUI API endpoint.
+ * @param {string} endpoint e.g. `/API/GetNewSession`
+ * @param {'direct'|'proxy'} transport
+ */
+function buildApiUrl(endpoint, transport) {
+    const base = normalizeBaseUrl(getSettings().base_url);
+    const target = `${base}${endpoint}`;
+    return transport === 'proxy' ? `/proxy/${target}` : target;
+}
+
+/**
+ * Performs a single SwarmUI API call over a specific transport.
+ * @param {string} endpoint API path
+ * @param {object} payload JSON body
+ * @param {{transport: string, timeout: number, signal?: AbortSignal}} options
+ * @returns {Promise<object>} Parsed JSON body
+ */
+async function requestOnce(endpoint, payload, { transport, timeout, signal }) {
+    const url = buildApiUrl(endpoint, transport);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeout);
+    const onAbort = () => controller.abort(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: ctx().getRequestHeaders(),
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+        });
+
+        const text = await response.text();
+
+        if (!response.ok) {
+            let detail = text || response.statusText;
+            let errorId = null;
+            try {
+                const parsed = JSON.parse(text);
+                detail = parsed.error || parsed.detail || detail;
+                errorId = parsed.error_id ?? null;
+            } catch { /* not JSON */ }
+
+            if (transport === 'proxy' && response.status === 404 && /CORS proxy is disabled/i.test(text)) {
+                const err = new Error('CORS proxy is disabled');
+                err.code = 'PROXY_DISABLED';
+                err.errorId = 'proxy_disabled';
+                throw err;
+            }
+
+            // SillyTavern's proxy returns a bare 500 when it cannot reach the target.
+            if (transport === 'proxy' && response.status === 500 && /^\s*Internal Server Error\s*$/i.test(text)) {
+                const err = new Error('SillyTavern could not reach SwarmUI through the proxy (is SwarmUI running at that URL?)');
+                err.code = 'PROXY_UNREACHABLE';
+                err.errorId = 'proxy_unreachable';
+                throw err;
+            }
+
+            const err = new Error(`SwarmUI (${transport}) responded ${response.status}: ${String(detail).slice(0, 400)}`);
+            err.status = response.status;
+            err.errorId = errorId;
+            err.transport = transport;
+            throw err;
+        }
+
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch {
+            throw new Error(`SwarmUI (${transport}) returned a non-JSON response: ${String(text).slice(0, 200)}`);
+        }
+
+        if (data && typeof data === 'object' && data.error) {
+            const err = new Error(String(data.error));
+            err.errorId = data.error_id ?? null;
+            err.transport = transport;
+            throw err;
+        }
+
+        return data;
+    } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+    }
+}
+
+/** True when a fetch failed because the request never reached the server. */
+function isNetworkError(error) {
+    if (!error) {
+        return false;
+    }
+    if (error.code === 'PROXY_DISABLED' || error.code === 'PROXY_UNREACHABLE') {
+        return true;
+    }
+    if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+        return false;
+    }
+    // fetch() rejects with a TypeError for CORS violations and connection failures.
+    return error instanceof TypeError || error.name === 'TypeError';
+}
+
+/**
+ * Calls a SwarmUI API endpoint, handling transport fallback and expired sessions.
+ * @param {string} endpoint `/API/...`
+ * @param {object} payload JSON body (session_id is added automatically)
+ * @param {{timeout?: number, signal?: AbortSignal, needsSession?: boolean, sessionRetry?: boolean}} [options]
+ * @returns {Promise<object>}
+ */
+async function apiCall(endpoint, payload = {}, options = {}) {
+    const {
+        timeout = REQUEST_TIMEOUT_MS,
+        signal = null,
+        needsSession = true,
+        sessionRetry = true,
+    } = options;
+
+    if (needsSession && !sessionId) {
+        await openSession();
+    }
+
+    const body = needsSession ? { session_id: sessionId, ...payload } : { ...payload };
+    const errors = [];
+
+    for (const transport of transportCandidates(null)) {
+        try {
+            const data = await requestOnce(endpoint, body, { transport, timeout, signal });
+            if (resolvedTransport !== transport) {
+                log(`Using "${transport}" transport for SwarmUI.`);
+                resolvedTransport = transport;
+            }
+            return data;
+        } catch (error) {
+            if (error?.errorId === 'invalid_session_id' && needsSession && sessionRetry) {
+                warn('SwarmUI session expired, opening a new one.');
+                sessionId = null;
+                await openSession(transport);
+                const retryBody = { session_id: sessionId, ...payload };
+                const retried = await requestOnce(endpoint, retryBody, { transport, timeout, signal });
+                resolvedTransport = transport;
+                return retried;
+            }
+
+            errors.push(error);
+
+            if (error?.code === 'PROXY_DISABLED') {
+                // Pointless to retry the same transport, but direct may still work.
+                warn('SillyTavern CORS proxy is disabled.');
+            }
+
+            const retryable = isNetworkError(error);
+            log(`Transport "${transport}" failed${retryable ? ' (network/CORS)' : ''}:`, error?.message ?? error);
+
+            if (!retryable) {
+                throw error;
+            }
+        }
+    }
+
+    const last = errors.at(-1);
+    const aggregate = new Error(buildTransportErrorMessage(errors));
+    aggregate.cause = last;
+    aggregate.transports = errors.map((e) => e.transport ?? 'direct');
+    throw aggregate;
+}
+
+function buildTransportErrorMessage(errors) {
+    const hasProxyDisabled = errors.some((e) => e?.code === 'PROXY_DISABLED');
+    const unreachable = errors.some((e) => e?.code === 'PROXY_UNREACHABLE');
+    const parts = ['Could not reach SwarmUI.'];
+    if (unreachable) {
+        parts.push('SillyTavern\'s proxy could not connect to that address.');
+    }
+    if (hasProxyDisabled) {
+        parts.push('SillyTavern\'s CORS proxy is disabled, so enable it in config.yaml (enableCorsProxy: true) or start SillyTavern with --corsProxy.');
+    }
+    if (errors.length > 1 || hasProxyDisabled || unreachable) {
+        parts.push('If SwarmUI is running, allow this page\'s origin in SwarmUI (AccessControlAllowOrigin) or use the proxy transport.');
+    }
+    const details = errors.map((e) => `• ${e?.transport ?? '?'}: ${e?.message ?? e}`).join('\n');
+    return `${parts.join(' ')}\n${details}`;
+}
+
+/** Opens a new SwarmUI session (and remembers which transport worked). */
+async function openSession(transportOverride = null) {
+    const payload = {};
+    const errors = [];
+    for (const transport of transportCandidates(transportOverride)) {
+        try {
+            const data = await requestOnce('/API/GetNewSession', payload, {
+                transport,
+                timeout: REQUEST_TIMEOUT_MS,
+                signal: null,
+            });
+            if (!data?.session_id) {
+                throw new Error(`SwarmUI did not return a session id: ${JSON.stringify(data).slice(0, 200)}`);
+            }
+            sessionId = data.session_id;
+            resolvedTransport = transport;
+            log(`New SwarmUI session ${sessionId} over "${transport}" (SwarmUI ${data.version ?? '?'}).`);
+            return sessionId;
+        } catch (error) {
+            errors.push(error);
+            if (!isNetworkError(error)) {
+                throw error;
+            }
+        }
+    }
+    const aggregate = new Error(buildTransportErrorMessage(errors));
+    aggregate.cause = errors.at(-1);
+    throw aggregate;
+}
+
+/** Drops the cached session so the next call creates a fresh one. */
+function invalidateSession() {
+    sessionId = null;
+    resolvedTransport = null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Resource loading (Connect)
+ * ------------------------------------------------------------------ */
+
+/**
+ * @param {'Stable-Diffusion'|'LoRA'|'VAE'|'Embedding'} subtype
+ * @returns {Promise<object[]>} Model file entries
+ */
+async function listModels(subtype) {
+    const data = await apiCall('/API/ListModels', { path: '', depth: 12, subtype });
+    return Array.isArray(data?.files) ? data.files : [];
+}
+
+/**
+ * Loads models/LoRAs/VAEs/samplers from SwarmUI into the settings cache.
+ * @param {{silent?: boolean}} [options] Silent mode only updates the status line.
+ */
+async function connect({ silent = false } = {}) {
+    const settings = getSettings();
+    const status = $('#swarm_status');
+    status.removeClass('swarm-ok swarm-error').text('Connecting…');
+
+    invalidateSession();
+
+    try {
+        await openSession();
+
+        const [sdFiles, loraFiles, vaeFiles, params] = await Promise.all([
+            listModels('Stable-Diffusion'),
+            listModels('LoRA'),
+            listModels('VAE'),
+            apiCall('/API/ListT2IParams'),
+        ]);
+
+        const paramList = Array.isArray(params?.list) ? params.list : [];
+        const findParam = (name) => paramList.find((p) => p.name === name);
+        const samplerParam = findParam('Sampler');
+        const schedulerParam = findParam('Scheduler');
+
+        settings.resources = {
+            models: sdFiles.map((f) => String(f.name)).filter(Boolean).sort((a, b) => a.localeCompare(b)),
+            loras: loraFiles.map((f) => ({
+                name: String(f.name),
+                title: f.title ? String(f.title) : String(f.name).replace(/\.[^.]+$/, ''),
+                trigger: f.trigger_phrase ? String(f.trigger_phrase) : '',
+                // SwarmUI reports "" when the LoRA has no default weight of its own.
+                default_weight: String(f.lora_default_weight ?? '').trim() === ''
+                    ? null
+                    : asNumber(f.lora_default_weight, null),
+            })),
+            vaes: vaeFiles.map((f) => String(f.name)).filter(Boolean).sort((a, b) => a.localeCompare(b)),
+            samplers: Array.isArray(samplerParam?.values) ? samplerParam.values.map(String) : [],
+            schedulers: Array.isArray(schedulerParam?.values) ? schedulerParam.values.map(String) : [],
+        };
+        settings.sampler_names = Array.isArray(samplerParam?.value_names) ? samplerParam.value_names.map(String) : [];
+        settings.scheduler_names = Array.isArray(schedulerParam?.value_names) ? schedulerParam.value_names.map(String) : [];
+        if (!settings.model && settings.resources.models.length > 0) {
+            settings.model = settings.resources.models[0];
+        }
+        saveSettings();
+        renderAllControls();
+
+        const transportLabel = resolvedTransport === 'proxy' ? 'via SillyTavern proxy' : 'direct';
+        const summary = `${settings.resources.models.length} checkpoint(s), ${settings.resources.loras.length} LoRA(s), ${settings.resources.samplers.length} sampler(s) — ${transportLabel}`;
+        status.addClass('swarm-ok').text(`Connected. ${summary}`);
+        log('Connect finished.', summary);
+        if (!silent) {
+            toastrSafe('success', `Connected to SwarmUI (${transportLabel}).`);
+        }
+        return true;
+    } catch (error) {
+        logError('Connect failed.', error);
+        status.addClass('swarm-error').text(String(error?.message ?? error).split('\n')[0]);
+        if (!silent) {
+            toastrSafe('error', String(error?.message ?? error).split('\n')[0]);
+        }
+        return false;
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Settings UI
+ * ------------------------------------------------------------------ */
+
+/**
+ * Fills a <select> with values, keeping the current selection when possible.
+ * @param {string} selector
+ * @param {string[]} values
+ * @param {string} current
+ * @param {{labels?: string[], lead?: (string|{value: string, label: string})[], placeholder?: string}} [options]
+ */
+function fillSelect(selector, values, current, options = {}) {
+    const { labels = null, lead = [], placeholder = '— click Connect —' } = options;
+    const $select = $(selector);
+    if (!$select.length) {
         return;
     }
-    initialized = true;
 
-    log('init called');
-    settings();
-    ensureMenuButton();
-    registerSlashCommand();
-    try {
-        eventSource.on(event_types.APP_INITIALIZED, ensureMenuButton);
-        eventSource.on(event_types.APP_READY, ensureMenuButton);
-    } catch (error) {
-        console.warn('[Native SwarmUI] event subscription failed:', error);
+    const items = [];
+    for (const entry of lead) {
+        items.push(typeof entry === 'string' ? { value: entry, label: entry } : entry);
     }
-    window.setTimeout(ensureMenuButton, 0);
-    window.setTimeout(ensureMenuButton, 500);
-    window.setTimeout(ensureMenuButton, 2000);
-    watchWandMenu();
+    values.forEach((value, index) => {
+        items.push({ value, label: labels?.[index] ? `${labels[index]} (${value})` : value });
+    });
+
+    const known = new Set(items.map((item) => item.value));
+    const keepCurrent = Boolean(current) && !known.has(current);
+    $select.empty();
+
+    if (items.length === 0 && !keepCurrent) {
+        $('<option></option>').val('').text(placeholder).appendTo($select);
+        return;
+    }
+
+    for (const item of items) {
+        $('<option></option>').val(item.value).text(item.label).appendTo($select);
+    }
+
+    if (keepCurrent) {
+        const label = items.length > 0 ? `${current} (not on server)` : current;
+        $('<option></option>').val(current).text(label).appendTo($select);
+    }
+
+    // Keep the stored value selected, otherwise fall back to the first entry.
+    $select.val(current || $select.find('option').first().val());
 }
 
-// Direct-execution fallback (same pattern as real third-party
-// extensions like Extension-Dice): if the `activate` hook is missed,
-// the module still self-initializes on load. Guarded + idempotent.
-if (typeof jQuery !== 'undefined') {
-    jQuery(() => {
+/** Repaints every dynamic control from the settings object. */
+function renderAllControls() {
+    const settings = getSettings();
+
+    fillSelect('#swarm_model', settings.resources.models, settings.model);
+    fillSelect('#swarm_vae', settings.resources.vaes, settings.vae, {
+        lead: [
+            { value: '', label: 'Automatic (use the model\'s own VAE)' },
+            { value: 'None', label: 'None' },
+        ],
+    });
+    fillSelect('#swarm_sampler', settings.resources.samplers, settings.sampler, {
+        labels: settings.sampler_names ?? [],
+    });
+    fillSelect('#swarm_scheduler', settings.resources.schedulers, settings.scheduler, {
+        labels: settings.scheduler_names ?? [],
+    });
+
+    fillLoraSelect();
+
+    $('#swarm_base_url').val(settings.base_url);
+    $('#swarm_transport').val(settings.transport);
+    $('#swarm_width').val(settings.width);
+    $('#swarm_height').val(settings.height);
+    $('#swarm_steps').val(settings.steps);
+    $('#swarm_cfg').val(settings.cfg);
+    $('#swarm_seed').val(settings.seed);
+    $('#swarm_images').val(settings.images);
+    $('#swarm_prefix_tags').val(settings.prefix_tags);
+    $('#swarm_suffix_tags').val(settings.suffix_tags);
+    $('#swarm_negative_prompt').val(settings.negative_prompt);
+    $('#swarm_llm_prompt').prop('checked', !!settings.llm_prompt);
+    $('#swarm_llm_instruction').val(settings.llm_instruction);
+    $('#swarm_lora_weight').val(settings.lora_weight);
+    $('#swarm_tag_weight').val(settings.tag_weight ?? DEFAULT_TAG_WEIGHT);
+
+    if (!settings.resources.models.length) {
+        $('#swarm_status').text('Not connected. Set the URL and press Connect.');
+    }
+
+    renderLoraChips();
+    updateCharacterTagsUi();
+}
+
+/** SwarmUI resolves LoRAs by name, so the file extension is stripped from the tag. */
+function loraTagName(lora) {
+    return String(lora?.name ?? '').replace(/\.(safetensors|sft|ckpt|pt)$/i, '');
+}
+
+/**
+ * Builds the `<lora:name:weight>` tags for every active LoRA chip.
+ * @param {{loras?: {name: string, weight: number}[]}} [settings]
+ * @returns {string} Comma separated tags, or '' when no LoRA is active
+ */
+function buildLoraTags(settings = getSettings()) {
+    return (settings.loras ?? []).map((lora) => `<lora:${loraTagName(lora)}:${lora.weight}>`).join(', ');
+}
+
+/**
+ * Removes `<lora:...>` tags for LoRAs that are active in the panel from a hand edited
+ * chat prompt. The chips stay authoritative: buildPrompt() appends their own tags and
+ * weights, so a tag typed by hand would otherwise apply the same LoRA twice.
+ * @param {string} scene
+ * @returns {string}
+ */
+function removeActiveLoraTags(scene) {
+    const active = getSettings().loras ?? [];
+    if (!active.length || !/<lora:/i.test(String(scene ?? ''))) {
+        return String(scene ?? '');
+    }
+
+    const removed = [];
+    const out = String(scene).replace(/<lora:[^>]*>/gi, (tag) => {
+        const lora = active.find((entry) => tag.toLowerCase().includes(loraTagName(entry).toLowerCase()));
+        if (!lora) {
+            return tag;
+        }
+        removed.push(loraTagName(lora));
+        return '';
+    });
+
+    if (removed.length === 0) {
+        return String(scene);
+    }
+    log('Removed hand-written LoRA tag(s) from the chat prompt, the active LoRAs are used instead:', removed.join(', '));
+    return fixImagePrompt(out);
+}
+
+/**
+ * Repaints the LoRA dropdown, ticking the LoRAs that are active. The tick in the list is the
+ * only feedback some phones show, since the chip row can sit below the visible area.
+ */
+function fillLoraSelect() {
+    const settings = getSettings();
+    const loras = Array.isArray(settings.resources.loras) ? settings.resources.loras : [];
+    const $select = $('#swarm_lora_select');
+    if (!$select.length) {
+        return;
+    }
+
+    const current = String($select.val() ?? '');
+    const active = new Set((settings.loras ?? []).map((lora) => lora.name));
+    $select.empty();
+
+    if (loras.length === 0) {
+        $('<option></option>').val('').text('— no LoRAs found —').appendTo($select);
+        return;
+    }
+
+    for (const lora of loras) {
+        // "Title (file.safetensors)" only when the title adds something over the file name.
+        const plainName = String(lora.name).replace(/\.[^.]+$/, '');
+        const label = lora.title && lora.title !== plainName ? `${lora.title} (${lora.name})` : lora.name;
+        $('<option></option>')
+            .val(lora.name)
+            .text(`${active.has(lora.name) ? '✓ ' : ''}${label}`)
+            .appendTo($select);
+    }
+
+    $select.val(loras.some((lora) => lora.name === current) ? current : loras[0].name);
+}
+
+function renderLoraChips() {
+    const settings = getSettings();
+    const $chips = $('#swarm_lora_chips');
+    if (!$chips.length) {
+        return;
+    }
+    $chips.empty();
+
+    if (!settings.loras.length) {
+        $chips.append($('<span class="swarm-chips-empty"></span>').text('No active LoRAs — choose one above to activate it.'));
+        return;
+    }
+
+    settings.loras.forEach((lora, index) => {
+        const $chip = $('<span class="swarm-chip"></span>');
+        $chip.append($('<span class="swarm-chip-name"></span>').text(lora.name).attr('title', lora.name));
+        $chip.append($('<span class="swarm-chip-weight"></span>').text(`:${lora.weight}`));
+        const $remove = $('<i class="fa-solid fa-xmark swarm-chip-remove" title="Remove"></i>');
+        $remove.on('click', () => {
+            settings.loras.splice(index, 1);
+            saveSettings();
+            renderLoraChips();
+            fillLoraSelect();
+        });
+        $chip.append($remove);
+        $chips.append($chip);
+    });
+}
+
+function addLoraFromUi() {
+    const settings = getSettings();
+    const name = String($('#swarm_lora_select').val() ?? '').trim();
+    if (!name) {
+        toastrSafe('warning', 'Pick a LoRA first (press Connect if the list is empty).');
+        return;
+    }
+    const weight = asNumber($('#swarm_lora_weight').val(), settings.lora_weight);
+    const existing = settings.loras.find((l) => l.name === name);
+    if (existing) {
+        existing.weight = weight;
+    } else {
+        settings.loras.push({ name, weight });
+    }
+    settings.lora_weight = weight;
+    saveSettings();
+    renderLoraChips();
+    fillLoraSelect();
+    if (weight === 0) {
+        toastrSafe('warning', 'A LoRA weight of 0 disables the LoRA; use a value like 0.8.');
+    }
+    log(`LoRA set: ${name}:${weight}`);
+}
+
+/* ------------------------------------------------------------------ *
+ * Per-character appearance and outfit tags, and the user's outfit
+ * ------------------------------------------------------------------ */
+
+/** @type {Map<string, string>} "key:avatar" -> tags, avoids repeated server reads */
+const characterTagsCache = new Map();
+/** @type {Map<string, ReturnType<typeof setTimeout>>} "key:avatar" -> pending save timer */
+const characterTagsSaveTimers = new Map();
+let userOutfitSaveTimer = null;
+
+/**
+ * @param {{characterId?: number|string, avatar?: string}} [target]
+ * @returns {{avatar: string|null, character: any|null}}
+ */
+function resolveCharacter(target = {}) {
+    const context = ctx();
+    if (target.avatar) {
+        const character = context.characters?.find((c) => c?.avatar === target.avatar) ?? null;
+        return { avatar: target.avatar, character };
+    }
+    const id = target.characterId ?? context.characterId;
+    if (id === undefined || id === null || id === '' || !context.characters?.[id]) {
+        return { avatar: null, character: null };
+    }
+    return { avatar: context.characters[id].avatar ?? null, character: context.characters[id] };
+}
+
+/** @returns {string} Cache key for one tag box of one avatar. */
+function characterTagsCacheKey(avatar, key) {
+    return `${key}:${avatar}`;
+}
+
+/**
+ * @param {string} avatar Character avatar
+ * @param {string} key LOOK_TAGS_KEY or OUTFIT_TAGS_KEY
+ * @returns {string} Tags, from cache or the character card
+ */
+function readCharacterTags(avatar, key) {
+    if (!avatar) {
+        return '';
+    }
+    const cacheKey = characterTagsCacheKey(avatar, key);
+    if (characterTagsCache.has(cacheKey)) {
+        return characterTagsCache.get(cacheKey);
+    }
+    const character = ctx().characters?.find((c) => c?.avatar === avatar);
+    const raw = character?.data?.extensions?.[key];
+    const value = typeof raw === 'string' ? raw : '';
+    characterTagsCache.set(cacheKey, value);
+    return value;
+}
+
+/** Persists appearance/outfit tags on the character card. */
+async function writeCharacterTags(avatar, key, value) {
+    const context = ctx();
+    const index = context.characters?.findIndex((c) => c?.avatar === avatar) ?? -1;
+    if (index < 0) {
+        warn('Cannot save the character tags: character not found for avatar', avatar);
+        return;
+    }
+    characterTagsCache.set(characterTagsCacheKey(avatar, key), value);
+    try {
+        await context.writeExtensionField(index, key, value);
+    } catch (error) {
+        logError('Failed to save the character tags.', error);
+        toastrSafe('error', 'Could not save the character tags.');
+    }
+}
+
+/** Debounced save so typing does not hammer the character card. */
+function queueCharacterTagsSave(avatar, key, value) {
+    const cacheKey = characterTagsCacheKey(avatar, key);
+    characterTagsCache.set(cacheKey, value);
+    const timer = characterTagsSaveTimers.get(cacheKey);
+    if (timer) {
+        clearTimeout(timer);
+    }
+    characterTagsSaveTimers.set(cacheKey, setTimeout(() => {
+        characterTagsSaveTimers.delete(cacheKey);
+        writeCharacterTags(avatar, key, value);
+    }, TAGS_SAVE_DELAY_MS));
+}
+
+/** @returns {string} Appearance tags of the character ("1girl, long black hair, ..."). */
+function readAppearanceTags(avatar) {
+    return readCharacterTags(avatar, LOOK_TAGS_KEY);
+}
+
+/** @returns {string} Outfit tags of the character ("red kimono, black obi"). */
+function readOutfitTags(avatar) {
+    return readCharacterTags(avatar, OUTFIT_TAGS_KEY);
+}
+
+/** @returns {string} The key the user's outfit is stored under - the current persona. */
+function userOutfitKey() {
+    const context = ctx();
+    return String(context.user_avatar || context.name1 || 'default');
+}
+
+/** @returns {string} Outfit tags of the current persona. */
+function readUserOutfit() {
+    const stored = getSettings().user_outfits?.[userOutfitKey()];
+    return typeof stored === 'string' ? stored : '';
+}
+
+/** Stores the persona's outfit in the extension settings (debounced). */
+function queueUserOutfitSave(value) {
+    const settings = getSettings();
+    if (!settings.user_outfits || typeof settings.user_outfits !== 'object') {
+        settings.user_outfits = {};
+    }
+    settings.user_outfits[userOutfitKey()] = value;
+    if (userOutfitSaveTimer) {
+        clearTimeout(userOutfitSaveTimer);
+    }
+    userOutfitSaveTimer = setTimeout(() => {
+        userOutfitSaveTimer = null;
+        saveSettings();
+    }, TAGS_SAVE_DELAY_MS);
+}
+
+/** Currently displayed character in the appearance/outfit boxes. */
+function currentCharacterTagsAvatar() {
+    const context = ctx();
+    if (context.groupId) {
+        return null;
+    }
+    return resolveCharacter().avatar;
+}
+
+/** Repaints the appearance, outfit and persona outfit boxes. */
+function updateCharacterTagsUi() {
+    const context = ctx();
+    const group = !!context.groupId;
+    const { avatar, character } = resolveCharacter();
+    const name = character?.name ?? avatar ?? '';
+
+    /**
+     * @param {string} targetId Hint element that names the character
+     * @param {string} inputId Textarea of the box
+     * @param {string} label What the box holds ("Appearance", "Outfit", ...)
+     * @param {string} value Current tags
+     */
+    const setCharacterBox = (targetId, inputId, label, value) => {
+        const $target = $(targetId);
+        const $input = $(inputId);
+        if (!$target.length || !$input.length) {
+            return;
+        }
+        if (group) {
+            $target.text(`Group chat: ${label.toLowerCase()} tags are taken from the character that wrote the message.`);
+            $input.val('').prop('disabled', true);
+            return;
+        }
+        if (!avatar) {
+            $target.text('No character selected.');
+            $input.val('').prop('disabled', true);
+            return;
+        }
+        $target.text(`Editing ${label.toLowerCase()} for: ${name}`);
+        $input.prop('disabled', false);
+        $input.val(value);
+    };
+
+    setCharacterBox('#swarm_look_tags_target', '#swarm_look_tags', 'Appearance', avatar ? readAppearanceTags(avatar) : '');
+    setCharacterBox('#swarm_outfit_tags_target', '#swarm_outfit_tags', 'Outfit', avatar ? readOutfitTags(avatar) : '');
+
+    const $userTarget = $('#swarm_user_outfit_target');
+    const $userInput = $('#swarm_user_outfit');
+    if ($userTarget.length && $userInput.length) {
+        $userTarget.text(`Your outfit: ${context.name1 ?? 'you'}`);
+        $userInput.prop('disabled', false);
+        $userInput.val(readUserOutfit());
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Prompt building
+ * ------------------------------------------------------------------ */
+
+/** Keeps the emphasis setting inside sane limits (1 = plain tags). */
+function clampTagWeight(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return DEFAULT_TAG_WEIGHT;
+    }
+    return Math.min(TAG_WEIGHT_MAX, Math.max(TAG_WEIGHT_MIN, number));
+}
+
+/**
+ * Wraps a tag group in SwarmUI's own weight syntax: `<weight[1.2]:tags>`.
+ * This is what keeps an outfit from drifting: the scene prompt often brings its own
+ * clothing words (from the chat message or the LLM), and without emphasis those
+ * overrule the outfit boxes.
+ * @param {string} text Tag list
+ * @param {number} weight Emphasis, 1 returns the tags unchanged
+ * @returns {string}
+ */
+function weighTags(text, weight) {
+    const clean = String(text ?? '').trim();
+    if (!clean) {
+        return '';
+    }
+    const number = Number(weight);
+    if (!Number.isFinite(number) || Math.abs(number - 1) < 0.001) {
+        return clean;
+    }
+    return `<weight[${String(Number(number.toFixed(2)))}]:${clean}>`;
+}
+
+/**
+ * Assembles the final SwarmUI prompt.
+ * @param {{scene: string, appearanceTags?: string, characterOutfit?: string, userOutfit?: string, settings?: any}} options
+ * @returns {string}
+ */
+function buildPrompt({ scene, appearanceTags = '', characterOutfit = '', userOutfit = '', settings = getSettings() }) {
+    const weight = clampTagWeight(settings.tag_weight);
+    const parts = [
+        weighTags(substituteSafe(appearanceTags), weight),
+        weighTags(substituteSafe(characterOutfit), weight),
+        weighTags(substituteSafe(userOutfit), weight),
+        substituteSafe(settings.prefix_tags),
+        scene,
+        substituteSafe(settings.suffix_tags),
+    ].filter((part) => part && String(part).trim().length > 0);
+
+    const base = fixImagePrompt(parts.join(', '));
+    // LoRA tags are appended after cleanup so they are never mangled.
+    const loraTags = buildLoraTags(settings);
+
+    return loraTags ? (base ? `${base}, ${loraTags}` : loraTags) : base;
+}
+
+function buildNegativePrompt() {
+    const settings = getSettings();
+    return fixImagePrompt(substituteSafe(settings.negative_prompt));
+}
+
+/** @returns {any|null} The most recent usable chat message (the built-in extension's "last message"). */
+function lastUsableMessage() {
+    const context = ctx();
+    return (context.chat ?? []).slice().reverse().find((m) => m && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) ?? null;
+}
+
+/** @returns {any|null} The character card that belongs to the last usable message. */
+function characterOfLastMessage() {
+    const context = ctx();
+    const message = lastUsableMessage();
+    if (!message) {
+        return null;
+    }
+    if (context.groupId) {
+        return (context.characters ?? []).find((c) => c?.avatar === message.original_avatar) ?? null;
+    }
+    return context.characters?.[context.characterId] ?? null;
+}
+
+/** @returns {string} The most recent usable chat message turned into tags. */
+function lastMessagePrompt() {
+    const message = lastUsableMessage();
+    return message ? stripFormatting(message.mes) : '';
+}
+
+/**
+ * "Raw Last Message": the last message exactly as written, followed by the character's
+ * scenario and description with weights - the same composite the built-in extension sends.
+ * @returns {string}
+ */
+function rawLastMessagePrompt() {
+    const message = lastUsableMessage();
+    if (!message) {
+        return '';
+    }
+    const character = characterOfLastMessage();
+    const scenario = stripFormatting(character?.scenario ?? character?.data?.scenario ?? '');
+    const description = stripFormatting(character?.description ?? character?.data?.description ?? '');
+    const parts = [`((${stripFormatting(message.mes)}))`];
+    if (scenario) {
+        parts.push(`(${scenario}:0.7)`);
+    }
+    if (description) {
+        parts.push(`(${description}:0.5)`);
+    }
+    return parts.join(', ');
+}
+
+/**
+ * Builds the scene part of the prompt for a "Send me a picture of:" source.
+ * @param {string} source Key of PICTURE_SOURCES, or '' for the plain generation flow
+ * @param {boolean} [forceLlm] Write the scene with the chat model even if the panel says otherwise
+ * @returns {Promise<string>}
+ */
+async function sourceScenePrompt(source, forceLlm = false) {
+    const settings = getSettings();
+    if (source === 'raw_last') {
+        return rawLastMessagePrompt();
+    }
+    if (source && SOURCE_INSTRUCTIONS[source]) {
+        return await writeScenePrompt(substituteSafe(SOURCE_INSTRUCTIONS[source]));
+    }
+    return (forceLlm || settings.llm_prompt) ? await writeScenePrompt() : lastMessagePrompt();
+}
+
+/** @returns {{avatar: string|null}} Character that authored the last usable message. */
+function lastMessageCharacter() {
+    const context = ctx();
+    const message = (context.chat ?? []).slice().reverse().find((m) => m && !m.is_system && !m.is_user);
+    if (context.groupId && message?.original_avatar) {
+        return { avatar: message.original_avatar };
+    }
+    if (!context.groupId) {
+        return { avatar: resolveCharacter().avatar };
+    }
+    return { avatar: null };
+}
+
+/**
+ * Asks the chat LLM to turn the recent chat into image tags. When a previous prompt exists it is
+ * quoted back with a request for a different take: without it, a model that is asked twice about
+ * the same chat often repeats its own last answer word for word, which makes "New prompt" look
+ * like it did nothing.
+ * @param {string} [instruction] Overrides the instruction configured in the panel
+ * @returns {Promise<string>}
+ */
+async function writeScenePrompt(instruction = '') {
+    const settings = getSettings();
+    let quietPrompt = String(instruction || settings.llm_instruction || DEFAULT_LLM_INSTRUCTION);
+    const previous = String(settings.last_prompt ?? '').trim();
+    if (previous) {
+        quietPrompt += `\n\nThe previous image was already made with this prompt: "${previous.slice(0, 700)}". Write a new prompt for the current chat: keep the characters and their outfits, change the camera angle, the pose or the framing where it fits, and do not copy the old prompt word for word.`;
+    }
+    log('Asking the chat model for a prompt…', previous ? '(told not to repeat the last one)' : '');
+    const result = await ctx().generateQuietPrompt({
+        quietPrompt,
+        quietToLoud: false,
+        removeReasoning: true,
+    });
+    const cleaned = stripFormatting(result);
+    log('LLM prompt:', cleaned);
+    if (previous && cleaned && cleaned === previous) {
+        warn('The chat model repeated the previous prompt word for word.');
+        toastrSafe('info', 'The chat model returned the same prompt as the last image.');
+    }
+    return cleaned;
+}
+
+/* ------------------------------------------------------------------ *
+ * Generation
+ * ------------------------------------------------------------------ */
+
+/**
+ * "Edit prompts before generation": shows the chat prompt - the text taken from the chat
+ * (or typed by hand), without the appearance/outfit tags, prefix tags, suffix tags, LoRA
+ * tags and the negative prompt - so it can be corrected, or the generation cancelled, before anything
+ * reaches SwarmUI. Everything else is added afterwards, exactly as configured in the panel.
+ * @param {string} sceneText The chat prompt to review
+ * @returns {Promise<string>} The edited chat prompt
+ * @throws {Error} An error with `.cancelled` set when the user cancels
+ */
+async function reviewSceneBeforeSending(sceneText) {
+    const popupShow = ctx().Popup?.show;
+    const cancelled = (message) => {
+        const error = new Error(message);
+        error.cancelled = true;
+        return error;
+    };
+
+    if (typeof popupShow?.input !== 'function') {
+        warn('This SillyTavern version has no popup API; sending the prompt as it is.');
+        return String(sceneText ?? '');
+    }
+
+    const edited = await popupShow.input(
+        'Review and edit the prompt:',
+        'Press "Cancel" to abort the image generation.<br><small>Only the chat prompt is shown here — your appearance, outfit, prefix/suffix and LoRA tags and the negative prompt are added automatically.</small>',
+        String(sceneText ?? '').trim(),
+        {
+            rows: 8,
+            okButton: 'Continue',
+            cancelButton: 'Cancel',
+        },
+    );
+
+    if (edited === null || edited === undefined) {
+        throw cancelled('Image generation cancelled.');
+    }
+
+    const scene = String(edited).trim();
+    if (!scene) {
+        throw cancelled('The prompt is empty; generation cancelled.');
+    }
+
+    log('Chat prompt reviewed before generation:', scene);
+    return scene;
+}
+
+/**
+ * True when the scene prompt for this trigger is written by the chat model, i.e. "New prompt"
+ * asks the model again and costs tokens. "Raw Last Message" never does, and without the panel's
+ * LLM option the plain buttons read the last chat message instead.
+ * @param {string} [source] Key of PICTURE_SOURCES, or '' for the plain generation flow
+ * @param {boolean} [forceLlm]
+ * @returns {boolean}
+ */
+function scenePromptUsesLlm(source = '', forceLlm = false) {
+    if (source === 'raw_last') {
+        return false;
+    }
+    if (source && SOURCE_INSTRUCTIONS[source]) {
+        return true;
+    }
+    return !!(forceLlm || getSettings().llm_prompt);
+}
+
+/**
+ * Asks what the pressed image button should do: write a new prompt (the chat model may be
+ * asked again, which costs tokens) or reuse the chat prompt of the last image. Only called
+ * when the setting is on and a previous prompt exists.
+ * @param {boolean} [usesLlm] Whether "New prompt" asks the chat model (see scenePromptUsesLlm)
+ * @returns {Promise<'new'|'reuse'|'cancel'>}
+ */
+async function askPromptChoice(usesLlm = false) {
+    const popupShow = ctx().Popup?.show;
+    if (typeof popupShow?.confirm !== 'function') {
+        return 'new';
+    }
+
+    const lastPrompt = String(getSettings().last_prompt ?? '').trim();
+    const preview = lastPrompt.length > 220 ? `${lastPrompt.slice(0, 220)}…` : lastPrompt;
+    const newPromptNote = usesLlm
+        ? 'asks the chat model again and tells it to change the angle, the pose or the framing instead of repeating the old prompt (uses tokens)'
+        : 'just reads the last chat message again - without "Let the chat LLM write the scene prompt" it stays the same until the chat changes';
+    const result = await popupShow.confirm(
+        'Generate an image',
+        [
+            '<div>The chat prompt of the last image was:</div>',
+            `<div><i>${escapeForPopup(preview)}</i></div>`,
+            `<div><small><b>New prompt</b> ${newPromptNote}. <b>Old prompt, new image</b> reuses that prompt and only makes a new picture (no chat model call, no tokens).</small></div>`,
+        ].join(''),
+        {
+            customButtons: [
+                {
+                    text: 'New prompt',
+                    result: 1,
+                    tooltip: usesLlm
+                        ? 'Ask the chat model for a new prompt. It is told to change the angle, the pose or the framing instead of repeating the last prompt (uses tokens).'
+                        : 'Read the last chat message again and build the prompt from it. Without "Let the chat LLM write the scene prompt" it changes only when the chat changes.',
+                },
+                {
+                    text: 'Old prompt, new image',
+                    result: 2,
+                    tooltip: 'Reuse the chat prompt of the last image. Costs no tokens.',
+                },
+            ],
+            okButton: false,
+            cancelButton: 'Cancel',
+        },
+    );
+
+    if (result === 2) {
+        return 'reuse';
+    }
+    if (result === 1) {
+        return 'new';
+    }
+    return 'cancel';
+}
+
+/**
+ * Entry point for the buttons that generate from the chat (wand menu entry, message button,
+ * "Generate now"). Offers "New prompt" or "Old prompt, new image" first when that is switched
+ * on and a previous prompt exists, so a new image can be made without asking the chat model.
+ * "New prompt" keeps writing with the chat model when the panel says so; the model is then
+ * told to vary the last prompt instead of repeating it.
+ * @param {{sceneText?: string, forceLlm?: boolean, quiet?: boolean, overrides?: object, targetAvatar?: string|null, source?: string}} options
+ * @returns {Promise<string>} The saved image path (empty on failure or cancel).
+ */
+async function generateFromButton(options = {}) {
+    const settings = getSettings();
+    if (settings.ask_prompt_choice !== false && String(settings.last_prompt ?? '').trim()) {
+        const choice = await askPromptChoice(scenePromptUsesLlm(options.source, options.forceLlm));
+        if (choice === 'reuse') {
+            log('Reusing the last chat prompt:', settings.last_prompt);
+            return await generateImage({
+                ...options,
+                sceneText: settings.last_prompt,
+                source: String(settings.last_source ?? ''),
+            });
+        }
+        if (choice !== 'new') {
+            toastrSafe('info', 'Image generation cancelled.');
+            return '';
+        }
+    }
+    return await generateImage(options);
+}
+
+/**
+ * Runs a full generation and posts the result to chat.
+ * @param {{sceneText?: string, forceLlm?: boolean, quiet?: boolean, overrides?: object, targetAvatar?: string|null, source?: string}} options
+ * @returns {Promise<string>} The saved image path (empty on failure).
+ */
+async function generateImage({ sceneText = '', forceLlm = false, quiet = false, overrides = {}, targetAvatar = null, source = '' } = {}) {
+    if (busy) {
+        toastrSafe('warning', 'An image is already being generated.');
+        return '';
+    }
+
+    const settings = getSettings();
+    busy = true;
+    updateBusyUi(true);
+
+    try {
+        if (!settings.model && settings.resources.models.length === 0) {
+            await connect();
+        }
+        if (!settings.model) {
+            throw new Error('No checkpoint model selected. Press Connect and pick a model.');
+        }
+
+        // 1. The chat prompt: either the text we were given (message button, /swarm <text>,
+        //    function tool) or what the chosen "Send me a picture of:" source produces.
+        let scene = stripFormatting(sceneText);
+        if (!scene) {
+            scene = await sourceScenePrompt(source, forceLlm);
+        }
+        if (!scene) {
+            throw new Error('No prompt text available. Send a chat message, or use /swarm <prompt>.');
+        }
+
+        // 2. Appearance and outfit tags. "Me" and "Background" are not the character, so her
+        //    tags stay out; "Yourself" and "Your Face" never show the user, so their outfit does.
+        const showCharacter = !SOURCES_WITHOUT_CHARACTER_TAGS.has(source);
+        const showUser = !SOURCES_WITHOUT_USER_TAGS.has(source);
+        const avatar = targetAvatar ?? lastMessageCharacter().avatar;
+        const appearanceTags = settings.use_look_tags && showCharacter && avatar ? readAppearanceTags(avatar) : '';
+        const characterOutfit = showCharacter && avatar ? readOutfitTags(avatar) : '';
+        const userOutfit = showUser ? readUserOutfit() : '';
+        if (sceneText && settings.use_look_tags && showCharacter && !avatar) {
+            log('No character resolved for the appearance tags; generating without them.');
+        }
+
+        // 3. Optional: show only the chat prompt and let it be corrected before sending.
+        if (settings.edit_before_generation) {
+            scene = removeActiveLoraTags(await reviewSceneBeforeSending(scene));
+        }
+
+        // Remember what was drawn, so the buttons can offer "old prompt, new image" later.
+        settings.last_prompt = scene;
+        settings.last_source = source;
+        saveSettings();
+
+        // 4. Parameters. Prefix, suffix, look and LoRA tags are added here - after the
+        //    review - so the popup only ever shows the chat prompt itself.
+        const params = {
+            prompt: buildPrompt({ scene, appearanceTags, characterOutfit, userOutfit, settings }),
+            negativeprompt: buildNegativePrompt(),
+            model: settings.model,
+            sampler: overrides.sampler ?? settings.sampler,
+            scheduler: overrides.scheduler ?? settings.scheduler,
+            steps: asNumber(overrides.steps ?? settings.steps, 25),
+            cfgscale: asNumber(overrides.cfg ?? settings.cfg, 6),
+            width: Math.max(64, Math.round(asNumber(overrides.width ?? settings.width, 832))),
+            height: Math.max(64, Math.round(asNumber(overrides.height ?? settings.height, 1216))),
+            images: Math.max(1, Math.round(asNumber(overrides.images ?? settings.images, 1))),
+            seed: Math.round(asNumber(overrides.seed ?? settings.seed, -1)),
+        };
+        if (overrides.model) {
+            params.model = String(overrides.model);
+        }
+        const vae = overrides.vae ?? settings.vae;
+        if (vae) {
+            params.vae = String(vae);
+        }
+
+        log('Request:', {
+            model: params.model,
+            sampler: params.sampler,
+            scheduler: params.scheduler,
+            width: params.width,
+            height: params.height,
+            steps: params.steps,
+            cfg: params.cfgscale,
+            seed: params.seed,
+            images: params.images,
+            prompt: params.prompt,
+            negative: params.negativeprompt,
+        });
+
+        // 5. Generate
+        const started = performance.now();
+        const result = await apiCall('/API/GenerateText2Image', params, {
+            timeout: GENERATION_TIMEOUT_MS,
+        });
+        const seconds = ((performance.now() - started) / 1000).toFixed(1);
+
+        const imagePath = Array.isArray(result?.images) && result.images.length > 0 ? String(result.images[0]) : '';
+        if (!imagePath) {
+            throw new Error(`SwarmUI did not return an image: ${JSON.stringify(result).slice(0, 300)}`);
+        }
+        log(`Generated ${imagePath} in ${seconds}s.`);
+
+        // 6. Download and store inside SillyTavern's user images folder
+        const { base64, format } = await downloadImage(imagePath);
+        const chatIdBefore = ctx().getCurrentChatId();
+
+        const context = ctx();
+        const folder = context.groupId
+            ? String(context.groupId)
+            : (context.characters?.[context.characterId]?.name ?? '');
+        const filename = `swarm_${folder || 'chat'}_${context.humanizedDateTime()}`;
+        const savedPath = await saveBase64AsFile(base64, folder, filename, format);
+        log(`Saved to ${savedPath}`);
+
+        if (source === 'background') {
+            await applyChatBackground(savedPath);
+        }
+
+        if (!quiet) {
+            if (ctx().getCurrentChatId() !== chatIdBefore) {
+                toastrSafe('warning', 'Chat changed, the generated image was not posted.');
+                return savedPath;
+            }
+            await postImageToChat({ imageUrl: savedPath, prompt: params.prompt, negative: params.negativeprompt, width: params.width, height: params.height, seconds });
+        }
+
+        toastrSafe('success', `Image generated in ${seconds}s.`);
+        return savedPath;
+    } catch (error) {
+        if (error?.cancelled) {
+            toastrSafe('info', String(error.message ?? 'Image generation cancelled.'));
+            return '';
+        }
+        if (error?.name === 'AbortError') {
+            toastrSafe('info', 'Generation stopped.');
+            return '';
+        }
+        logError('Generation failed.', error);
+        toastrSafe('error', String(error?.message ?? error).split('\n')[0]);
+        return '';
+    } finally {
+        busy = false;
+        updateBusyUi(false);
+    }
+}
+
+/**
+ * The built-in extension treats "Background" as "make this the chat's background image",
+ * so the picture generated with that source is applied here too.
+ * @param {string} imagePath Path of the saved image inside SillyTavern's user images
+ * @returns {Promise<void>}
+ */
+async function applyChatBackground(imagePath) {
+    const context = ctx();
+    const source = context.eventSource;
+    const event = context.eventTypes?.FORCE_SET_BACKGROUND;
+    if (!source?.emit || !event) {
+        return;
+    }
+    try {
+        await source.emit(event, { url: `url("${encodeURI(imagePath)}")`, path: imagePath });
+        log('Set the generated image as the chat background.');
+    } catch (error) {
+        warn('Could not set the chat background.', error);
+    }
+}
+
+/** Fetches a generated image from SwarmUI and returns it as base64 + format. */
+async function downloadImage(imagePath) {
+    const transport = resolvedTransport ?? 'direct';
+    const base = normalizeBaseUrl(getSettings().base_url);
+    const path = imagePath.replace(/^\/+/, '');
+    const url = transport === 'proxy'
+        ? `/proxy/${base}/${encodeImagePath(path)}`
+        : `${base}/${encodeImagePath(path)}`;
+
+    let response;
+    try {
+        response = await fetch(url, { headers: ctx().getRequestHeaders() });
+    } catch (error) {
+        // The API call worked but the image fetch did not: retry once over the  other transport.
+        const fallback = transport === 'proxy' ? 'direct' : 'proxy';
+        warn(`Image download over "${transport}" failed, retrying with "${fallback}".`, error);
+        const fallbackUrl = fallback === 'proxy'
+            ? `/proxy/${base}/${encodeImagePath(path)}`
+            : `${base}/${encodeImagePath(path)}`;
+        response = await fetch(fallbackUrl, { headers: ctx().getRequestHeaders() });
+    }
+
+    if (!response.ok) {
+        throw new Error(`Could not download the generated image (HTTP ${response.status}).`);
+    }
+
+    const blob = await response.blob();
+    const base64 = await blobToBase64(blob);
+    const parserWarnings = readParserWarnings(base64);
+    if (parserWarnings.length > 0) {
+        warn('SwarmUI prompt warnings:', parserWarnings);
+        toastrSafe('warning', parserWarnings.join(' ').slice(0, 300));
+    }
+    const extension = (path.match(/\.([a-z0-9]+)$/i)?.[1] ?? 'png').toLowerCase();
+    const format = ALLOWED_IMAGE_FORMATS.includes(extension) ? extension : 'png';
+    return { base64, format };
+}
+
+/** Posts the generated image into the chat as a hidden-from-LLM system message. */
+async function postImageToChat({ imageUrl, prompt, negative, width, height, seconds }) {
+    const context = ctx();
+    const name = context.groupId ? SYSTEM_USER_NAME : (context.name2 ?? SYSTEM_USER_NAME);
+
+    const mediaAttachment = {
+        url: imageUrl,
+        type: MEDIA_TYPE_IMAGE,
+        title: prompt,
+        generation_type: GENERATION_TYPE_MESSAGE,
+        negative: negative,
+        source: MEDIA_SOURCE_GENERATED,
+        width: width,
+        height: height,
+    };
+
+    const mes = seconds ? `${prompt}\nGenerated in ${seconds}s.` : prompt;
+
+    const message = {
+        name: name,
+        is_user: false,
+        // System messages never reach the language model prompt.
+        is_system: true,
+        send_date: new Date().toISOString(),
+        mes,
+        extra: {
+            media: [mediaAttachment],
+            media_display: MEDIA_DISPLAY_GALLERY,
+            media_index: 0,
+            inline_image: false,
+            swarm_image: true,
+        },
+    };
+
+    context.chat.push(message);
+    const messageId = context.chat.length - 1;
+    await context.eventSource.emit(context.eventTypes.MESSAGE_RECEIVED, messageId, 'extension');
+    context.addOneMessage(message);
+    await context.eventSource.emit(context.eventTypes.CHARACTER_MESSAGE_RENDERED, messageId, 'extension');
+    await context.saveChat();
+    setTimeout(() => {
         try {
-            init();
-        } catch (error) {
-            console.error('[Native SwarmUI] fallback init failed:', error);
+            context.scrollOnMediaLoad();
+        } catch { /* not fatal */ }
+    }, SCROLL_DELAY_MS);
+}
+
+function updateBusyUi(isBusy) {
+    $('.swarm_mes_gen').attr('data-swarm-busy', isBusy ? 'true' : 'false');
+    $('#swarm_generate_now').attr('data-swarm-busy', isBusy ? 'true' : 'false');
+}
+
+/* ------------------------------------------------------------------ *
+ * Message buttons
+ * ------------------------------------------------------------------ */
+
+const MESSAGE_BUTTON_CLASS = 'swarm_mes_gen';
+// The wand icon is also used by this extension's own "Generate now" button, and it is
+// deliberately different from the paintbrush of SillyTavern's built-in image extension,
+// so the two buttons in a message's action row can never be confused with each other.
+const MESSAGE_BUTTON_HTML = `<div title="Generate an image for this message (SwarmUI)" class="mes_button ${MESSAGE_BUTTON_CLASS} fa-solid fa-wand-magic-sparkles" data-i18n="[title]Generate an image for this message (SwarmUI)"></div>`;
+
+/** Entry in SillyTavern's wand menu - the one next to the chat box that holds "Attach a File" and friends. */
+const WAND_MENU_ITEM_HTML = `<div id="swarm_menu_gen" class="list-group-item flex-container flexGap5">
+    <div class="fa-solid fa-wand-magic-sparkles extensionsMenuExtensionButton" title="Generate an image from the current chat with SwarmUI" data-i18n="[title]Generate an image from the current chat with SwarmUI"></div>
+    <span data-i18n="Generate Image (SwarmUI)">Generate Image (SwarmUI)</span>
+    <div id="swarm_source_toggle" class="extensionsMenuExtensionButton fa-solid fa-caret-right swarm-source-toggle" title="Choose what the picture should show (Yourself, Your Face, Me, the last message, ...)" data-i18n="[title]Choose what the picture should show (Yourself, Your Face, Me, the last message, ...)"></div>
+</div>`;
+
+/**
+ * The "Send me a picture of:" list, with the same entries as the built-in Image Generation
+ * extension. Like the built-in one it is appended to <body> so the wand menu's own scroll
+ * container can never clip it.
+ */
+const SOURCE_MENU_HTML = `<ul id="swarm_source_menu" class="list-group">
+    <span data-i18n="Send me a picture of:">Send me a picture of:</span>
+    ${Object.entries(PICTURE_SOURCES).map(([key, label]) => `<li class="list-group-item" id="swarm_source_${key}" data-value="${key}" data-i18n="${label}">${label}</li>`).join('\n    ')}
+</ul>`;
+
+/** Guards against adding the source list twice (SillyTavern activates once per page load). */
+let sourceMenuInstalled = false;
+
+/**
+ * Shows or hides the "Send me a picture of:" list above the caret. The built-in extension
+ * anchors its version with Popper; a fixed position keeps this extension free of extra
+ * dependencies and behaves the same on phones.
+ * @param {boolean} [force] `true` shows, `false` hides, omitted toggles
+ * @returns {void}
+ */
+function toggleSourceMenu(force) {
+    const $menu = $('#swarm_source_menu');
+    if (!$menu.length) {
+        return;
+    }
+
+    const open = typeof force === 'boolean' ? force : $menu.css('display') !== 'block';
+    if (!open) {
+        $menu.css('display', 'none');
+        return;
+    }
+
+    $menu.css({ display: 'block', left: '0px', top: '0px' });
+
+    const element = $('#swarm_source_toggle').get(0);
+    const rect = element?.getBoundingClientRect?.();
+    const viewport = globalThis.window;
+    if (!rect || !viewport) {
+        return;
+    }
+
+    const menuHeight = $menu.get(0)?.offsetHeight || 280;
+    const menuWidth = $menu.get(0)?.offsetWidth || 260;
+    const above = rect.top - menuHeight > 8;
+    const top = above ? rect.top - menuHeight : rect.bottom + 8;
+    const left = Math.max(8, Math.min(rect.left, viewport.innerWidth - menuWidth - 8));
+    $menu.css({
+        left: `${Math.round(left)}px`,
+        top: `${Math.round(Math.max(8, Math.min(top, viewport.innerHeight - menuHeight - 8)))}px`,
+    });
+}
+
+/** Adds the "Send me a picture of:" list and wires it to the caret next to the menu entry. */
+function installSourceMenu() {
+    if (sourceMenuInstalled) {
+        return;
+    }
+    sourceMenuInstalled = true;
+
+    $('body').append(SOURCE_MENU_HTML);
+
+    // The caret sits inside the wand menu entry, so the row's own click handler (which
+    // generates an image) must not also fire when the list is opened.
+    $(document).on('click', '#swarm_source_toggle', (event) => {
+        event?.stopPropagation?.();
+        toggleSourceMenu();
+    });
+
+    for (const [key, label] of Object.entries(PICTURE_SOURCES)) {
+        $(`#swarm_source_${key}`).on('click', () => {
+            toggleSourceMenu(false);
+            log(`Picture source: ${label} (${key})`);
+            return generateImage({ source: key });
+        });
+    }
+
+    // Any click outside the caret and the list closes it again.
+    $(document).on('click', (event) => {
+        const target = $(event?.target);
+        if (target.closest('#swarm_source_menu, #swarm_source_toggle').length) {
+            return;
+        }
+        toggleSourceMenu(false);
+    });
+}
+
+/** Adds the per-message button to the message template and to rendered messages. */
+function injectMessageButtons() {
+    const $templateButtons = $('#message_template .extraMesButtons');
+    if ($templateButtons.length && !$templateButtons.find(`.${MESSAGE_BUTTON_CLASS}`).length) {
+        $(MESSAGE_BUTTON_HTML).appendTo($templateButtons);
+    }
+
+    $('#chat .mes .extraMesButtons').each(function () {
+        if (!$(this).find(`.${MESSAGE_BUTTON_CLASS}`).length) {
+            $(MESSAGE_BUTTON_HTML).appendTo(this);
         }
     });
-} else if (typeof document !== 'undefined') {
-    document.addEventListener('DOMContentLoaded', () => {
-        try {
-            init();
-        } catch (error) {
-            console.error('[Native SwarmUI] fallback init failed:', error);
+}
+
+/** Ensures the button exists on a single message element. */
+function ensureMessageButton(messageId) {
+    const $buttons = $(`#chat .mes[mesid="${messageId}"] .extraMesButtons`);
+    if ($buttons.length && !$buttons.find(`.${MESSAGE_BUTTON_CLASS}`).length) {
+        $(MESSAGE_BUTTON_HTML).appendTo($buttons);
+    }
+}
+
+async function onMessageButtonClick(event) {
+    const $icon = $(event.currentTarget);
+    const messageId = Number($icon.closest('.mes').attr('mesid'));
+    const context = ctx();
+    const message = context.chat?.[messageId];
+    if (!message) {
+        logError('Could not find the message for the SwarmUI button.', messageId);
+        return;
+    }
+
+    if (message.extra?.swarm_image) {
+        toastrSafe('info', 'This message is a generated image. Use /swarm or the message above it.');
+        return;
+    }
+
+    const avatar = message.original_avatar ?? null;
+    const scene = stripFormatting(message.mes);
+    await generateFromButton({ sceneText: scene, targetAvatar: avatar });
+}
+/* ------------------------------------------------------------------ *
+ * Slash command
+ * ------------------------------------------------------------------ */
+
+/**
+ * Turns "/swarm you", "/swarm face", ... into the matching picture source, the same
+ * shortcuts the built-in "/sd" command accepts.
+ * @param {string} text The command's value
+ * @returns {string} A key of PICTURE_SOURCES, or '' when the text is a normal prompt
+ */
+function pictureSourceOf(text) {
+    const key = String(text ?? '').trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(PICTURE_SOURCES, key) ? key : '';
+}
+
+function registerSlashCommand() {
+    const context = ctx();
+    const { SlashCommandParser, SlashCommand, SlashCommandNamedArgument, SlashCommandArgument, ARGUMENT_TYPE } = context;
+    if (!SlashCommandParser || !SlashCommand) {
+        warn('Slash command API is unavailable, /swarm is not registered.');
+        return;
+    }
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'swarm',
+        returns: 'URL of the generated image, or an empty string if the generation failed',
+        callback: async (args, value) => {
+            const text = String(value ?? '').trim();
+            // "/swarm you", "/swarm face", ... use the same shortcuts as the source menu.
+            const source = pictureSourceOf(text);
+            const prompt = source ? '' : text;
+            const overrides = {};
+            for (const key of ['model', 'sampler', 'scheduler', 'vae', 'width', 'height', 'steps', 'cfg', 'seed', 'images']) {
+                if (args?.[key] !== undefined && args[key] !== '' && args[key] !== null) {
+                    overrides[key] = String(args[key]);
+                }
+            }
+            return await generateImage({
+                sceneText: prompt,
+                source,
+                forceLlm: !prompt && !source,
+                quiet: asBoolean(args?.quiet),
+                overrides,
+            });
+        },
+        aliases: ['swarmui', 'swarmimage'],
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'do not post the generated image to the chat',
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'model',
+                description: 'checkpoint model override',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'sampler',
+                description: 'sampler override',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'scheduler',
+                description: 'scheduler override',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'vae',
+                description: 'VAE override',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'width',
+                description: 'image width',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'height',
+                description: 'image height',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'steps',
+                description: 'number of sampling steps',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'cfg',
+                description: 'CFG scale',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'seed',
+                description: 'seed (-1 for random)',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'images',
+                description: 'how many images to generate',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+                isRequired: false,
+                acceptsMultiple: false,
+            }),
+        ],
+        unnamedArgumentList: [
+            new SlashCommandArgument('prompt', [ARGUMENT_TYPE.STRING], false, false, null, null),
+        ],
+        helpString: `
+            <div>
+                Generates an image with SwarmUI and posts it to the chat as a system message (hidden from the model).
+            </div>
+            <div>
+                <code>/swarm a cat on a throne</code> uses the given text as the scene prompt.<br>
+                <code>/swarm</code> with no text asks the chat model to write the scene prompt from the recent chat
+                (or uses the last message if "Let the chat LLM write the scene prompt" is disabled).<br>
+                <code>/swarm you</code> (or <code>face</code>, <code>me</code>, <code>scene</code>, <code>last</code>,
+                <code>raw_last</code>, <code>background</code>) uses the same "Send me a picture of:" sources as
+                SillyTavern's built-in image menu.
+            </div>
+            <div>
+                Active SwarmUI LoRAs, prefix/suffix tags, the current character's appearance/outfit tags and your own outfit are always applied.
+            </div>
+        `,
+    }));
+
+    log('Registered the /swarm slash command.');
+}
+
+/* ------------------------------------------------------------------ *
+ * UI wiring
+ * ------------------------------------------------------------------ */
+
+function bindSettingsEvents() {
+    const settings = getSettings();
+
+    $('#swarm_connect').on('click', async () => {
+        settings.base_url = String($('#swarm_base_url').val() ?? '').trim() || DEFAULT_BASE_URL;
+        saveSettings();
+        await connect();
+    });
+
+    $('#swarm_transport').on('change', () => {
+        settings.transport = String($('#swarm_transport').val() ?? 'auto');
+        invalidateSession();
+        saveSettings();
+        log(`Transport set to "${settings.transport}".`);
+    });
+
+    $('#swarm_base_url').on('input', () => {
+        const value = String($('#swarm_base_url').val() ?? '').trim();
+        if (settings.base_url !== value) {
+            settings.base_url = value;
+            invalidateSession();
+            saveSettings();
         }
     });
+
+    $('#swarm_model').on('change', () => {
+        settings.model = String($('#swarm_model').val() ?? '');
+        saveSettings();
+    });
+
+    $('#swarm_vae').on('change', () => {
+        settings.vae = String($('#swarm_vae').val() ?? '');
+        saveSettings();
+    });
+
+    const numberBindings = {
+        '#swarm_width': 'width',
+        '#swarm_height': 'height',
+        '#swarm_steps': 'steps',
+        '#swarm_cfg': 'cfg',
+        '#swarm_seed': 'seed',
+        '#swarm_images': 'images',
+    };
+    for (const [selector, key] of Object.entries(numberBindings)) {
+        $(selector).on('input change', () => {
+            settings[key] = asNumber($(selector).val(), settings[key]);
+            saveSettings();
+        });
+    }
+
+    $('#swarm_tag_weight').on('input', () => {
+        settings.tag_weight = clampTagWeight(asNumber($('#swarm_tag_weight').val(), settings.tag_weight));
+        saveSettings();
+    });
+
+    $('#swarm_sampler').on('change', () => {
+        settings.sampler = String($('#swarm_sampler').val() ?? '');
+        saveSettings();
+    });
+
+    $('#swarm_scheduler').on('change', () => {
+        settings.scheduler = String($('#swarm_scheduler').val() ?? '');
+        saveSettings();
+    });
+
+    const textBindings = {
+        '#swarm_prefix_tags': 'prefix_tags',
+        '#swarm_suffix_tags': 'suffix_tags',
+        '#swarm_negative_prompt': 'negative_prompt',
+    };
+    for (const [selector, key] of Object.entries(textBindings)) {
+        $(selector).on('input', () => {
+            settings[key] = String($(selector).val() ?? '');
+            saveSettings();
+        });
+    }
+
+    $('#swarm_llm_prompt').on('change', () => {
+        settings.llm_prompt = !!$('#swarm_llm_prompt').prop('checked');
+        saveSettings();
+    });
+
+    $('#swarm_llm_instruction').on('input', () => {
+        settings.llm_instruction = String($('#swarm_llm_instruction').val() ?? '') || DEFAULT_LLM_INSTRUCTION;
+        saveSettings();
+    });
+
+    $('#swarm_lora_add').on('click', () => addLoraFromUi());
+    // Choosing a LoRA in the list activates it immediately: the dropdown and the weight box are
+    // the live controls. The "+ Add" button only exists to re-apply the weight.
+    $('#swarm_lora_select').on('change', () => {
+        const settings = getSettings();
+        const loras = settings.resources.loras ?? [];
+        const selected = loras.find((lora) => lora.name === String($('#swarm_lora_select').val() ?? ''));
+        const serverWeight = asNumber(selected?.default_weight, null);
+        if (serverWeight !== null && serverWeight > 0) {
+            $('#swarm_lora_weight').val(serverWeight);
+        }
+        addLoraFromUi();
+    });
+    // Retyping the weight updates the active chip of the selected LoRA on the fly.
+    $('#swarm_lora_weight').on('input', () => {
+        const settings = getSettings();
+        const name = String($('#swarm_lora_select').val() ?? '');
+        const lora = (settings.loras ?? []).find((entry) => entry.name === name);
+        if (!lora) {
+            return;
+        }
+        const weight = asNumber($('#swarm_lora_weight').val(), lora.weight);
+        if (weight === lora.weight) {
+            return;
+        }
+        lora.weight = weight;
+        settings.lora_weight = weight;
+        saveSettings();
+        renderLoraChips();
+    });
+    $('#swarm_lora_weight').on('keydown', (event) => {
+        if (event.key === 'Enter') {
+            addLoraFromUi();
+        }
+    });
+
+    const $lookTags = $('#swarm_look_tags');
+    $lookTags.on('input', () => {
+        const avatar = currentCharacterTagsAvatar();
+        if (!avatar) {
+            return;
+        }
+        queueCharacterTagsSave(avatar, LOOK_TAGS_KEY, String($lookTags.val() ?? ''));
+    });
+
+    const $outfitTags = $('#swarm_outfit_tags');
+    $outfitTags.on('input', () => {
+        const avatar = currentCharacterTagsAvatar();
+        if (!avatar) {
+            return;
+        }
+        queueCharacterTagsSave(avatar, OUTFIT_TAGS_KEY, String($outfitTags.val() ?? ''));
+    });
+
+    $('#swarm_user_outfit').on('input', () => {
+        queueUserOutfitSave(String($('#swarm_user_outfit').val() ?? ''));
+    });
+
+    $('#swarm_generate_now').on('click', async () => {
+        await generateFromButton({});
+    });
+
+    $('#swarm_hide_builtin').prop('checked', settings.hide_builtin_buttons === true);
+    $('#swarm_hide_builtin').on('change', () => {
+        settings.hide_builtin_buttons = !!$('#swarm_hide_builtin').prop('checked');
+        settings.hide_builtin_chosen = true;
+        saveSettings();
+        applyBuiltinImageUiVisibility();
+    });
+
+    const checkboxBindings = {
+        '#swarm_edit_before_generation': 'edit_before_generation',
+        '#swarm_ask_prompt_choice': 'ask_prompt_choice',
+        '#swarm_interactive_mode': 'interactive_mode',
+        '#swarm_function_tool': 'function_tool',
+    };
+    for (const [selector, key] of Object.entries(checkboxBindings)) {
+        $(selector).prop('checked', settings[key] === true);
+        $(selector).on('change', () => {
+            settings[key] = !!$(selector).prop('checked');
+            saveSettings();
+            registerSwarmFunctionTool();
+        });
+    }
+
+    $(document).on('click', '#swarm_menu_gen', () => generateFromButton({}));
+
+    $(document).on('click', `.mes_button.${MESSAGE_BUTTON_CLASS}`, (event) => {
+        if (busy) {
+            toastrSafe('warning', 'An image is already being generated.');
+            return;
+        }
+        onMessageButtonClick(event);
+    });
+}
+
+/** Matches chat messages like "send me a picture of a cat" (the built-in extension uses a similar pattern). */
+const INTERACTIVE_ACTIVATION_REGEX = /\b(send|mail|imagine|generate|make|create|draw|paint|render|show)\b.{0,10}\b(pic|picture|image|drawing|painting|photo|photograph)\b(?:\s+of)?(?:\s+(?:a|an|the|this|that|those|your)?\s+)?(.+)/i;
+
+/** Name of the function tool offered to the chat model. */
+const FUNCTION_TOOL_NAME = 'GenerateImageSwarmUI';
+/** Display name of the function tool offered to the chat model. */
+const FUNCTION_TOOL_DISPLAY_NAME = 'Generate Image (SwarmUI)';
+
+/**
+ * "Interactive mode": when the user's own message asks for a picture, generate it right away,
+ * using the detected subject as the scene prompt.
+ * @returns {Promise<void>}
+ */
+async function onMessageSentForInteractiveMode() {
+    const settings = getSettings();
+    if (!settings.interactive_mode || busy) {
+        return;
+    }
+    // With the function tool enabled, the chat model itself decides when a picture is wanted.
+    if (settings.function_tool && ctx().isToolCallingSupported?.()) {
+        return;
+    }
+
+    const lastMessage = ctx().chat?.at(-1);
+    if (!lastMessage?.is_user || !lastMessage.mes) {
+        return;
+    }
+
+    const subject = String(lastMessage.mes).match(INTERACTIVE_ACTIVATION_REGEX)?.[3]?.trim();
+    if (!subject) {
+        return;
+    }
+
+    log(`Interactive mode: generating "${subject}"`);
+    await generateImage({ sceneText: subject });
+}
+
+/**
+ * "Use function tool": lets the chat model itself call SwarmUI through SillyTavern's tool
+ * calling when the story calls for a picture.
+ * @returns {void}
+ */
+function registerSwarmFunctionTool() {
+    const context = ctx();
+    const settings = getSettings();
+    if (typeof context.registerFunctionTool !== 'function' || typeof context.unregisterFunctionTool !== 'function') {
+        return; // SillyTavern too old for extension function tools.
+    }
+
+    context.unregisterFunctionTool(FUNCTION_TOOL_NAME);
+    if (!settings.function_tool) {
+        return;
+    }
+    if (typeof context.isToolCallingSupported === 'function' && !context.isToolCallingSupported()) {
+        warn('The current chat completion source does not support function tools; the tool is ready but will only be used once one is selected.');
+    }
+
+    context.registerFunctionTool({
+        name: FUNCTION_TOOL_NAME,
+        displayName: FUNCTION_TOOL_DISPLAY_NAME,
+        description: [
+            'Generate an image from a text prompt with the local SwarmUI server and post it into the chat.',
+            'Use it when the user asks for a picture, a photo, a drawing, a selfie, or to imagine a scene.',
+        ].join(' '),
+        parameters: Object.freeze({
+            $schema: 'http://json-schema.org/draft-04/schema#',
+            type: 'object',
+            properties: {
+                prompt: {
+                    type: 'string',
+                    description: 'A comma separated image prompt in booru tag style, e.g. "1girl, red dress, garden, sunset".',
+                },
+            },
+            required: ['prompt'],
+        }),
+        action: async (args) => {
+            if (!args?.prompt) {
+                throw new Error('Missing "prompt" argument.');
+            }
+            const url = await generateImage({ sceneText: String(args.prompt) });
+            if (!url) {
+                throw new Error('Image generation failed.');
+            }
+            return encodeURI(url);
+        },
+    });
+}
+
+function bindChatEvents() {
+    const context = ctx();
+    const events = context.eventTypes;
+    const source = context.eventSource;
+
+    source.on(events.CHARACTER_MESSAGE_RENDERED, (messageId) => ensureMessageButton(messageId));
+    source.on(events.USER_MESSAGE_RENDERED, (messageId) => ensureMessageButton(messageId));
+    source.on(events.CHAT_CHANGED, () => {
+        updateCharacterTagsUi();
+        setTimeout(injectMessageButtons, 50);
+    });
+    source.on(events.MESSAGE_DELETED, () => setTimeout(injectMessageButtons, 50));
+    source.on(events.MORE_MESSAGES_LOADED, () => setTimeout(injectMessageButtons, 50));
+    source.on(events.MESSAGE_SENT, () => onMessageSentForInteractiveMode());
+    source.on(events.CHARACTER_EDITED, () => {
+        characterTagsCache.clear();
+        updateCharacterTagsUi();
+    });
+    // Switching character or persona changes whose tags the boxes edit.
+    if (events.CHARACTER_SELECTED) {
+        source.on(events.CHARACTER_SELECTED, () => updateCharacterTagsUi());
+    }
+    if (events.PERSONA_CHANGED) {
+        source.on(events.PERSONA_CHANGED, () => updateCharacterTagsUi());
+    }
+}
+
+/** Guards against adding the wand-menu entry twice (SillyTavern activates once per page load). */
+let wandMenuInstalled = false;
+
+/**
+ * Adds "Generate Image (SwarmUI)" to SillyTavern's wand menu, where the built-in
+ * "Generate Image" entry also lives, so the button is where people look for it
+ * instead of only inside the Extensions drawer.
+ * @returns {void}
+ */
+function installWandMenuEntry() {
+    if (wandMenuInstalled) {
+        return;
+    }
+    const $menu = $('#extensionsMenu');
+    if (!$menu.length) {
+        return; // SillyTavern moved its menu: skip silently instead of breaking the page.
+    }
+    wandMenuInstalled = true;
+
+    // Sit exactly where the built-in "Generate Image" entry sits (third item, after
+    // "Attach a File") instead of at the bottom of the menu.
+    const $builtinSlot = $('#sd_wand_container');
+    if ($builtinSlot.length) {
+        $builtinSlot.after(WAND_MENU_ITEM_HTML);
+    } else {
+        $menu.append(WAND_MENU_ITEM_HTML);
+    }
+}
+
+/**
+ * SillyTavern's built-in Image Generation extension always talks to its own backend
+ * (ComfyUI, Automatic1111, Extras, ...) and can never use SwarmUI, so its buttons only
+ * get in the way. They are hidden by default; the checkbox in the panel brings them back.
+ * @returns {void}
+ */
+function applyBuiltinImageUiVisibility() {
+    const hide = getSettings().hide_builtin_buttons === true;
+    $('body').toggleClass('swarm-hide-builtin-image', hide);
+}
+
+/* ------------------------------------------------------------------ *
+ * Entry point (manifest.json -> hooks.activate: "onActivate")
+ * ------------------------------------------------------------------ */
+
+/**
+ * Loads settings.html from this module's own folder, whatever that folder is
+ * called, so the extension keeps working when the folder is renamed by hand,
+ * unzipped from a GitHub download (`swarm-image-gen-main`), or cloned under a
+ * different repository name.
+ * @returns {Promise<string>} The settings panel markup
+ */
+async function loadSettingsHtml() {
+    try {
+        const response = await fetch(new URL('settings.html', import.meta.url), { cache: 'no-cache' });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return await response.text();
+    } catch (error) {
+        warn('Could not fetch settings.html next to the module, using the SillyTavern helper instead.', error);
+        return await ctx().renderExtensionTemplateAsync('third-party/swarm-image-gen', 'settings');
+    }
+}
+
+let activated = false;
+
+/** Called by SillyTavern when the extension is activated. */
+export async function onActivate() {
+    if (activated) {
+        return;
+    }
+    activated = true;
+
+    try {
+        log('Activating…');
+    } catch (error) {
+        logError('SillyTavern context is not available; the extension cannot start.', error);
+        return;
+    }
+
+    try {
+        getSettings();
+
+        /** Each step is isolated: one failure must not disable the whole extension. */
+        const steps = [
+            ['settings panel', async () => {
+                const html = await loadSettingsHtml();
+                $('#extensions_settings2').append(html);
+            }],
+            ['function tool', async () => registerSwarmFunctionTool()],
+            ['wand menu entry', async () => {
+                installWandMenuEntry();
+                applyBuiltinImageUiVisibility();
+            }],
+            ['picture sources', async () => installSourceMenu()],
+            ['message buttons', async () => injectMessageButtons()],
+            ['settings events', async () => bindSettingsEvents()],
+            ['chat events', async () => bindChatEvents()],
+            ['slash command', async () => registerSlashCommand()],
+            ['controls', async () => renderAllControls()],
+        ];
+
+        for (const [name, step] of steps) {
+            try {
+                await step();
+            } catch (error) {
+                logError(`Failed to initialise the ${name}.`, error);
+            }
+        }
+
+        log('Ready. Panel added to the Extensions drawer.');
+
+        // Warm the connection up in the background when the extension is already configured,
+        // so the model/LoRA lists are up to date without pressing Connect every session.
+        const settings = getSettings();
+        if (settings.model || settings.resources.models.length > 0) {
+            connect({ silent: true });
+        }
+    } catch (error) {
+        logError('Failed to start the extension.', error);
+        toastrSafe('error', `Swarm Image Gen failed to start: ${error?.message ?? error}`);
+    }
 }
