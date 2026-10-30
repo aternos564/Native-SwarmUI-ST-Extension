@@ -447,6 +447,13 @@ let sessionId = null;
 let resolvedTransport = null;
 /** True while an image is being generated. */
 let busy = false;
+let genTimerInterval = null;
+let genTimerStart = 0;
+let genToast = null;
+let genToastStatus = null;
+let genToastFill = null;
+let genOriginalTitle = null;
+let genProgressState = null;
 
 /** @returns {string[]} Transports to try, in order. */
 function transportCandidates(override) {
@@ -1483,6 +1490,268 @@ async function generateFromButton(options = {}) {
     return await generateImage(options);
 }
 
+/** Converts the configured HTTP(S) base URL into the SwarmUI WebSocket URL. */
+function toWebSocketUrl(httpUrl) {
+    return `${normalizeBaseUrl(httpUrl).replace(/^http/i, 'ws')}/API/GenerateText2ImageWS`;
+}
+
+/** True when an https:// SillyTavern page is not allowed to open a ws:// socket. */
+function isMixedContentWebSocket(url) {
+    return typeof window !== 'undefined'
+        && window.location?.protocol === 'https:'
+        && /^ws:\/\//i.test(url);
+}
+
+/**
+ * SwarmUI sends progress as a fraction (0..1), but accepting 0..100 as well keeps this
+ * working if a future version changes the scale.
+ * @param {unknown} value
+ * @returns {number} A value between 0 and 1
+ */
+function normalizeFraction(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+        return 0;
+    }
+    return Math.min(1, Math.max(0, n > 1 ? n / 100 : n));
+}
+
+/**
+ * Runs one SwarmUI WebSocket generation attempt.
+ *
+ * SwarmUI's protocol (GenerateText2ImageWS):
+ *  - send `{ session_id, ...flattened T2I params }` after the socket opens;
+ *  - receive `{ gen_progress: { batch_index, overall_percent, current_percent } }`;
+ *  - receive `{ image: { image, batch_index, metadata } }`;
+ *  - optionally receive `{ discard_indices: [...] }` before the final
+ *    `{ socket_intention: "close" }`.
+ *
+ * @param {object} params Flattened SwarmUI T2I parameters (including images and steps)
+ * @param {(progress: {overall: number, current: number, step: number, steps: number, batchIndex: number, batchCount: number}) => void} [onProgress]
+ * @returns {Promise<{images: string[]}>}
+ */
+function runWebSocketGeneration(params, onProgress) {
+    const url = toWebSocketUrl(getSettings().base_url);
+    if (isMixedContentWebSocket(url)) {
+        const error = new Error('WebSocket is blocked because SillyTavern is served over HTTPS and SwarmUI uses ws://. Use an https/wss SwarmUI URL or the HTTP fallback.');
+        error.code = 'WS_MIXED_CONTENT';
+        return Promise.reject(error);
+    }
+    if (typeof WebSocket !== 'function') {
+        const error = new Error('This browser does not support WebSockets.');
+        error.code = 'WS_UNSUPPORTED';
+        return Promise.reject(error);
+    }
+
+    return new Promise((resolve, reject) => {
+        let socket;
+        try {
+            socket = new WebSocket(url);
+        } catch (error) {
+            reject(error);
+            return;
+        }
+
+        const wanted = Math.max(1, Math.round(Number(params.images) || 1));
+        const steps = Math.max(0, Math.round(Number(params.steps) || 0));
+        /** @type {Map<number, string>} batch index -> image path */
+        const images = new Map();
+        /** @type {Map<number, number>} batch index -> overall fraction */
+        const batchProgress = new Map();
+        let settled = false;
+        let sawServerMessage = false;
+        let settleTimer = null;
+        let openTimer = null;
+        let timeoutTimer = null;
+
+        const clearTimers = () => {
+            if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+            if (openTimer) { clearTimeout(openTimer); openTimer = null; }
+            if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
+        };
+
+        const finish = (error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimers();
+            try { socket.close(); } catch { /* already closed */ }
+
+            if (error) {
+                // A session error happens before SwarmUI starts generating, so the caller may
+                // safely retry. Every other failure after the first server message must not
+                // fall back to HTTP, or the image would be generated twice.
+                if (error.errorId !== 'invalid_session_id') {
+                    error.started = sawServerMessage;
+                }
+                reject(error);
+                return;
+            }
+
+            const list = [...images.entries()]
+                .sort((a, b) => a[0] - b[0])
+                .map(([, image]) => image);
+            resolve({ images: list });
+        };
+
+        // SwarmUI sends discard_indices after the last image, so wait a moment before
+        // accepting the result. `socket_intention: close` finishes immediately.
+        const maybeFinish = () => {
+            if (images.size >= wanted) {
+                if (!settleTimer) {
+                    settleTimer = setTimeout(() => finish(null), 500);
+                }
+            } else if (settleTimer) {
+                clearTimeout(settleTimer);
+                settleTimer = null;
+            }
+        };
+
+        openTimer = setTimeout(() => finish(new Error('WebSocket connection timed out.')), 10_000);
+        timeoutTimer = setTimeout(() => finish(new Error('WebSocket generation timed out.')), GENERATION_TIMEOUT_MS);
+
+        socket.onopen = () => {
+            if (openTimer) { clearTimeout(openTimer); openTimer = null; }
+            try {
+                socket.send(JSON.stringify({ session_id: sessionId, ...params }));
+            } catch (error) {
+                finish(error);
+            }
+        };
+
+        socket.onmessage = (event) => {
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch {
+                return;
+            }
+            if (!data || typeof data !== 'object') {
+                return;
+            }
+
+            if (data.error || data.error_id) {
+                const message = typeof data.error === 'string'
+                    ? data.error
+                    : data.error
+                        ? JSON.stringify(data.error)
+                        : String(data.error_id ?? 'SwarmUI returned an error.');
+                const error = new Error(message);
+                error.errorId = data.error_id ?? null;
+                finish(error);
+                return;
+            }
+
+            if (data.gen_progress) {
+                sawServerMessage = true;
+                const gp = data.gen_progress;
+                const batchIndexRaw = Number(gp.batch_index);
+                const batchIndex = Number.isFinite(batchIndexRaw) ? Math.max(0, batchIndexRaw) : 0;
+                const batchOverall = normalizeFraction(gp.overall_percent);
+                batchProgress.set(batchIndex, batchOverall);
+
+                let overall = batchOverall;
+                if (wanted > 1) {
+                    // With several images SwarmUI reports progress per batch item. Average the
+                    // known items so the bar does not jump back to zero for every image.
+                    let sum = 0;
+                    for (const value of batchProgress.values()) {
+                        sum += value;
+                    }
+                    overall = Math.min(1, sum / wanted);
+                }
+
+                const current = normalizeFraction(gp.current_percent);
+                const step = current > 0 && steps > 0
+                    ? Math.min(steps, Math.max(1, Math.round(current * steps)))
+                    : 0;
+                if (typeof onProgress === 'function') {
+                    try {
+                        onProgress({ overall, current, step, steps, batchIndex, batchCount: wanted });
+                    } catch (error) {
+                        warn('Could not update the generation progress display.', error);
+                    }
+                }
+                return;
+            }
+
+            if (data.image) {
+                sawServerMessage = true;
+                const raw = typeof data.image === 'string' ? data.image : data.image?.image;
+                if (raw) {
+                    const batchIndexRaw = Number(data.image?.batch_index ?? data.batch_index);
+                    const batchIndex = Number.isFinite(batchIndexRaw) ? batchIndexRaw : images.size;
+                    images.set(batchIndex, String(raw));
+                }
+                maybeFinish();
+                return;
+            }
+
+            if (Array.isArray(data.discard_indices)) {
+                sawServerMessage = true;
+                for (const index of data.discard_indices) {
+                    images.delete(Number(index));
+                }
+                maybeFinish();
+                return;
+            }
+
+            if (data.socket_intention === 'close') {
+                finish(null);
+                return;
+            }
+
+            // Status updates are harmless; remember that the server accepted the request so
+            // a later connection loss does not trigger a duplicate HTTP generation.
+            if (data.status || data.backend_status || data.supported_features) {
+                sawServerMessage = true;
+            }
+        };
+
+        socket.onerror = () => {
+            // Browsers hide the reason. onclose (or the safety timeout) finishes the request.
+        };
+
+        socket.onclose = (event) => {
+            if (settled) {
+                return;
+            }
+            if (images.size > 0) {
+                finish(null);
+                return;
+            }
+            const code = event?.code ? ` (code ${event.code})` : '';
+            const reason = event?.reason ? `: ${event.reason}` : '';
+            finish(new Error(`WebSocket closed before the image was generated${code}${reason}.`));
+        };
+    });
+}
+
+/**
+ * Generates over SwarmUI's WebSocket route, retrying once with a fresh session id when the
+ * cached session has expired.
+ * @param {object} params Flattened SwarmUI T2I parameters
+ * @param {(progress: object) => void} [onProgress]
+ * @returns {Promise<{images: string[]}>}
+ */
+async function generateViaWebSocket(params, onProgress, { retried = false } = {}) {
+    if (!sessionId) {
+        await openSession();
+    }
+    try {
+        return await runWebSocketGeneration(params, onProgress);
+    } catch (error) {
+        if (error?.errorId === 'invalid_session_id' && !retried) {
+            warn('SwarmUI session expired, opening a new one for the WebSocket request.');
+            sessionId = null;
+            await openSession();
+            return generateViaWebSocket(params, onProgress, { retried: true });
+        }
+        throw error;
+    }
+}
+
 /**
  * Runs a full generation and posts the result to chat.
  * @param {{sceneText?: string, forceLlm?: boolean, quiet?: boolean, overrides?: object, targetAvatar?: string|null, source?: string}} options
@@ -1575,11 +1844,31 @@ async function generateImage({ sceneText = '', forceLlm = false, quiet = false, 
             negative: params.negativeprompt,
         });
 
-        // 5. Generate
+        // 5. Generate. The WebSocket route reports real progress; HTTP is the fallback when
+        // the browser cannot open a socket (mixed content, reverse proxy without upgrade,
+        // old SwarmUI, ...). A socket that already delivered a server message must not fall
+        // back, because SwarmUI may still be generating the image.
+        startGenTimer();
         const started = performance.now();
-        const result = await apiCall('/API/GenerateText2Image', params, {
-            timeout: GENERATION_TIMEOUT_MS,
-        });
+        let result;
+        try {
+            result = await generateViaWebSocket(params, (progress) => {
+                updateGenProgress(progress);
+            });
+        } catch (wsError) {
+            console.error('[swarm] WebSocket generation failed:', wsError);
+            if (wsError?.started) {
+                throw wsError;
+            }
+            const reason = wsError?.code === 'WS_MIXED_CONTENT'
+                ? 'Live progress is unavailable because SillyTavern is on HTTPS and SwarmUI uses ws://. Using the HTTP API instead.'
+                : 'Live progress is unavailable; using the HTTP API instead.';
+            warn(reason, wsError);
+            toastrSafe('warning', reason);
+            result = await apiCall('/API/GenerateText2Image', params, {
+                timeout: GENERATION_TIMEOUT_MS,
+            });
+        }
         const seconds = ((performance.now() - started) / 1000).toFixed(1);
 
         const imagePath = Array.isArray(result?.images) && result.images.length > 0 ? String(result.images[0]) : '';
@@ -1627,6 +1916,7 @@ async function generateImage({ sceneText = '', forceLlm = false, quiet = false, 
         toastrSafe('error', String(error?.message ?? error).split('\n')[0]);
         return '';
     } finally {
+        stopGenTimer();
         busy = false;
         updateBusyUi(false);
     }
@@ -1707,15 +1997,13 @@ async function postImageToChat({ imageUrl, prompt, negative, width, height, seco
         height: height,
     };
 
-    const mes = seconds ? `${prompt}\nGenerated in ${seconds}s.` : prompt;
-
     const message = {
         name: name,
         is_user: false,
         // System messages never reach the language model prompt.
         is_system: true,
         send_date: new Date().toISOString(),
-        mes,
+        mes: seconds ? `${prompt}\nGenerated in ${seconds}s.` : prompt,
         extra: {
             media: [mediaAttachment],
             media_display: MEDIA_DISPLAY_GALLERY,
@@ -1741,6 +2029,123 @@ async function postImageToChat({ imageUrl, prompt, negative, width, height, seco
 function updateBusyUi(isBusy) {
     $('.swarm_mes_gen').attr('data-swarm-busy', isBusy ? 'true' : 'false');
     $('#swarm_generate_now').attr('data-swarm-busy', isBusy ? 'true' : 'false');
+}
+
+function startGenTimer() {
+    stopGenTimer();
+    genTimerStart = performance.now();
+    genOriginalTitle = document.title;
+    genProgressState = null;
+
+    try {
+        genToast = toastr.info('Generating image\u2026', 'Swarm Image Gen', {
+            timeOut: 0,
+            extendedTimeOut: 0,
+            closeButton: false,
+            tapToDismiss: false,
+            progressBar: false,
+        });
+    } catch {
+        genToast = null;
+    }
+
+    if (genToast?.length) {
+        const $message = genToast.find('.toast-message');
+        $message.empty()
+            .append($('<div class="swarm-gen-status">Generating image\u2026</div>'))
+            .append($('<div class="swarm-gen-progress"><div class="swarm-gen-progress-fill"></div></div>'));
+        genToastStatus = $message.find('.swarm-gen-status');
+        genToastFill = $message.find('.swarm-gen-progress-fill');
+    }
+
+    renderGenStatus();
+    genTimerInterval = setInterval(renderGenStatus, 100);
+}
+
+/**
+ * Stores the latest SwarmUI progress update. Rendering happens on the timer tick so a fast
+ * stream of progress messages cannot flood the DOM.
+ * @param {{overall?: number, current?: number, step?: number, steps?: number, batchIndex?: number, batchCount?: number}} progress
+ */
+function updateGenProgress(progress) {
+    if (!progress || typeof progress !== 'object') {
+        return;
+    }
+    genProgressState = {
+        overall: normalizeFraction(progress.overall),
+        current: normalizeFraction(progress.current),
+        step: Math.max(0, Math.round(Number(progress.step) || 0)),
+        steps: Math.max(0, Math.round(Number(progress.steps) || 0)),
+        batchIndex: Math.max(0, Math.round(Number(progress.batchIndex) || 0)),
+        batchCount: Math.max(1, Math.round(Number(progress.batchCount) || 1)),
+    };
+    renderGenStatus();
+}
+
+/** Paints the live percentage, step counter and elapsed time into the toast and tab title. */
+function renderGenStatus() {
+    if (!genTimerStart) {
+        return;
+    }
+
+    const elapsed = ((performance.now() - genTimerStart) / 1000).toFixed(1);
+    const progress = genProgressState;
+    const hasProgress = !!progress && (progress.overall > 0 || progress.current > 0);
+    const pct = hasProgress ? Math.round(progress.overall * 100) : 0;
+    const batchText = hasProgress && progress.batchCount > 1
+        ? ` \u00b7 image ${Math.min(progress.batchCount, progress.batchIndex + 1)}/${progress.batchCount}`
+        : '';
+    const stepText = hasProgress && progress.step > 0 && progress.steps > 0
+        ? ` \u00b7 step ${progress.step}/${progress.steps}`
+        : '';
+    const statusText = hasProgress
+        ? `Generating\u2026 ${pct}%${batchText}${stepText} \u00b7 ${elapsed}s`
+        : `Generating image\u2026 ${elapsed}s`;
+    const titleText = hasProgress
+        ? `Generating\u2026 ${pct}% \u00b7 ${elapsed}s`
+        : `Generating\u2026 ${elapsed}s`;
+
+    try {
+        document.title = titleText;
+    } catch { /* not fatal */ }
+
+    try {
+        if (genToastStatus?.length) {
+            genToastStatus.text(statusText);
+        }
+        if (genToastFill?.length) {
+            genToastFill.css('width', `${hasProgress ? pct : 0}%`);
+        }
+    } catch { /* the toast may have been closed by the user */ }
+}
+
+function stopGenTimer() {
+    if (genTimerInterval) {
+        clearInterval(genTimerInterval);
+        genTimerInterval = null;
+    }
+
+    if (genToast) {
+        try {
+            // Clear only this toast, never every toast on the page.
+            toastr.clear(genToast, { force: true });
+        } catch {
+            try { genToast.remove(); } catch { /* already gone */ }
+        }
+    }
+
+    genToast = null;
+    genToastStatus = null;
+    genToastFill = null;
+    genProgressState = null;
+    genTimerStart = 0;
+
+    if (genOriginalTitle !== null) {
+        try {
+            document.title = genOriginalTitle;
+        } catch { /* not fatal */ }
+        genOriginalTitle = null;
+    }
 }
 
 /* ------------------------------------------------------------------ *
