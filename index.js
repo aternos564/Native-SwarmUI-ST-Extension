@@ -209,14 +209,29 @@ function resolveImageSrc(imagePath) {
     }
 }
 
-async function sendToChat(imageSrc, prompt) {
+function formatTiming(elapsedMs, count, steps) {
+    const total = elapsedMs / 1000;
+    const perImage = total / Math.max(1, count);
+    const parts = [`Time: ${total.toFixed(2)}s`];
+    if (count > 1) {
+        parts.push(`${perImage.toFixed(2)}s/image`);
+    }
+    if (steps > 0 && perImage > 0) {
+        parts.push(`≈${(steps / perImage).toFixed(2)} it/s`);
+    }
+    return parts.join(' • ');
+}
+
+async function sendToChat(imageSrc, prompt, timing) {
     const context = getContext();
+    const messageText = prompt ? `[SwarmUI] ${prompt}` : '[SwarmUI image]';
+    const mes = timing ? `${messageText}\n${timing}` : messageText;
     const message = {
         name: context.name2 || 'SwarmUI',
         is_user: false,
         is_system: false,
         send_date: Date.now(),
-        mes: prompt ? `[SwarmUI] ${prompt}` : '[SwarmUI image]',
+        mes,
         extra: {
             media: [{
                 url: imageSrc,
@@ -251,6 +266,8 @@ async function generate(panel, options = {}) {
         return { images: [] };
     }
 
+    const startedAt = performance.now();
+
     let session_id;
     try {
         session_id = await newSession();
@@ -264,6 +281,7 @@ async function generate(panel, options = {}) {
     const seed = Number(panel.find('#swarmui_native_seed').val());
     const loras = Array.from(panel.find('#swarmui_native_lora').val() || []).map(String);
     const loraWeight = Number(panel.find('#swarmui_native_lora_weight').val()) || 0.8;
+    const steps = Math.round(Number(panel.find('#swarmui_native_steps').val()) || 20);
     // Field names/types per SwarmUI T2IParamTypes (prompt, negativeprompt,
     // model, loras/loraweights, vae, sampler, steps, cfgscale, width,
     // height, images, seed); numbers stay numbers.
@@ -310,15 +328,18 @@ async function generate(panel, options = {}) {
                 .appendTo(output);
         }
 
+        const elapsedMs = performance.now() - startedAt;
+        const timing = formatTiming(elapsedMs, srcs.length, steps);
+
         if (options.sendToChat) {
             for (const src of srcs) {
-                await sendToChat(src, prompt);
+                await sendToChat(src, prompt, timing);
             }
-            status.text(`Generation complete ✅ • sent ${srcs.length} image(s) to chat`);
+            status.text(`Generation complete ✅ • ${srcs.length} image(s) • ${timing} • sent to chat`);
         } else {
-            status.text(`Generation complete ✅ • ${srcs.length} image(s)`);
+            status.text(`Generation complete ✅ • ${srcs.length} image(s) • ${timing}`);
         }
-        return { images: srcs };
+        return { images: srcs, timing };
     } catch (error) {
         console.error('Native SwarmUI generation error:', error);
         status.text(`Generation failed: ${error.message}`);
@@ -492,6 +513,7 @@ async function slashGenerate(promptText) {
     if (!prompt) {
         return '';
     }
+    const startedAt = performance.now();
     const session_id = await newSession();
     const payload = {
         session_id,
@@ -515,8 +537,10 @@ async function slashGenerate(promptText) {
     }
     const result = await apiPost('GenerateText2Image', payload);
     const srcs = (result.images || []).map(resolveImageSrc);
+    const elapsedMs = performance.now() - startedAt;
+    const timing = formatTiming(elapsedMs, srcs.length, Math.round(Number(s.steps)) || 20);
     for (const src of srcs) {
-        await sendToChat(src, prompt);
+        await sendToChat(src, prompt, timing);
     }
     return srcs[0] || '';
 }
